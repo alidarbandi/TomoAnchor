@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.env
+.env.*
+.vscode/
+.idea/
+*.local.yaml
+config-*.yaml
+
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
+# App run outputs and reconstruction data
+output/
+outputs/
+runs/
+*_output/
+*.log
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mha
+*.mhd
+*.nii
+*.nii.gz
+*.raw
+*.tif
+*.tiff
+
+# Large or generated local experiment folders
+data/
+datasets/
+projections/
+reference/
+dark/
+metadata/
+tv_mbir_ct_recon/icon_suggestions/
+
+# OS files
+.DS_Store
+Thumbs.db

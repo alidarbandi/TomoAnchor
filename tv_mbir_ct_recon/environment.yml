@@ -1,0 +1,20 @@
+name: tomoanchor
+channels:
+  - ccpi
+  - astra-toolbox
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - pandas
+  - tifffile
+  - matplotlib
+  - pyyaml
+  - scikit-image
+  - pyqt
+  - pytest
+  - tigre=2.6
+  - pip

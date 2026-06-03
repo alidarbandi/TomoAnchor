@@ -1,0 +1,258 @@
+input:
+  projection_folder: ""
+  flat_folder: ""
+  dark_folder: ""
+  metadata_path: ""
+  output_folder: "output"
+
+metadata:
+  filename_column: ""
+  angle_column: ""
+  angle_rad_column: ""
+  x_shift_column: ""
+  y_shift_column: ""
+  remove_duplicate_endpoint: true
+  reverse_angle_order: false
+
+preprocessing:
+  use_dark: true
+  use_flat: true
+  negative_log: true
+  epsilon: 1.0e-6
+  transmission_clip_min: 1.0e-6
+  transmission_clip_max: 2.0
+  max_transmission_for_log: 2.0
+  clip_transmission: true
+  clip_negative_attenuation_to_zero: true
+  crop: [0, 0, 0, 0]
+  binning: [1, 1]
+  flip_horizontal: false
+  flip_vertical: false
+  transpose_for_tigre: false
+  truncation_correction: false
+  truncation_extension_fraction: 0.1
+
+geometry:
+  source_detector_distance_mm: null
+  source_origin_distance_mm: null
+  effective_pixel_size_um: 11.0
+  detector_pixel_size_mm: [null, null]
+  detector_pixels: [null, null]
+  voxel_size_mm: [0.011, 0.011, 0.011]
+  volume_voxels: [null, null, null]
+  detector_offset_pixels: [0.0, 0.0]
+  origin_offset_mm: [0.0, 0.0, 0.0]
+  angle_units: "degrees"
+  angle_start: 0.0
+  angle_end: 360.0
+  endpoint_included: false
+  angle_direction: "ccw"
+  angle_file: null
+  invert_angle_sign_for_tigre: true
+  fdk_filter: "ram_lak"
+
+alignment:
+  center_offset_pixels: 0.0
+  center_shift_sign: 1.0
+  center_offset_method: "detector_offset"
+  use_center_correction: true
+  use_drift_correction: true
+  drift_shift_file: null
+  estimate_drift: false
+  drift_units: "pixels_after_binning"
+  drift_stage: "transmission"
+  x_shift_sign: 1
+  y_shift_sign: 1
+  shift_interpretation_sign: 1
+  shift_interpolation_order: 1
+  shift_boundary_mode: "nearest"
+
+initialization:
+  mode: "fdk"
+  fdk_volume_path: null
+  constant_value: 0.0
+
+mbir:
+  solver: "auto"
+  lambda_tv: 0.001
+  rho: 0.05
+  tv_type: "isotropic_3d"
+  tv_epsilon: 1.0e-8
+  positivity: true
+  max_admm_iterations: 50
+  inner_cg_iterations: 10
+  tolerance_primal: 1.0e-4
+  tolerance_dual: 1.0e-4
+  tolerance_relative_change: 1.0e-5
+  cg_tolerance: 1.0e-4
+  save_every: 5
+  debug_pixel_binning: [1, 1]
+  projection_stride: 1
+  memory_mode: "auto"
+  projection_batch_size: 64
+  ordered_subset_count: 1
+  pdhg_power_iterations: 3
+  pdhg_step_safety: 0.95
+  pdhg_theta: 1.0
+  pdhg_dual_dtype: "float16"
+  pdhg_chunk_slices: 16
+  subset_tv_power_iterations: 2
+  subset_tv_step_safety: 0.7
+  use_weights: false
+  weight_mode: "none"
+  weight_file: null
+  photon_count_based_weights: false
+  flat_intensity_based_weights: false
+
+gpu:
+  use_gpu: true
+  gpu_id: 0
+  gpu_selector: "auto"
+  use_cupy_for_tv_ops: true
+
+logging:
+  verbose: true
+  save_plots: true
+  save_intermediate: true
+
+anchors:
+  enabled: true
+  input:
+    projection_folder: ""
+    flat_folder: ""
+    dark_folder: ""
+    metadata_path: ""
+  metadata:
+    filename_column: ""
+    angle_column: ""
+    angle_rad_column: ""
+    x_shift_column: ""
+    y_shift_column: ""
+    remove_duplicate_endpoint: true
+    reverse_angle_order: false
+  preprocessing:
+    inherit_main: true
+    use_dark: true
+    use_flat: true
+    negative_log: true
+    epsilon: 1.0e-6
+    transmission_clip_min: 1.0e-6
+    transmission_clip_max: 2.0
+    max_transmission_for_log: 2.0
+    clip_transmission: true
+    clip_negative_attenuation_to_zero: true
+    crop: [0, 0, 0, 0]
+    binning: [1, 1]
+    flip_horizontal: false
+    flip_vertical: false
+    transpose_for_tigre: false
+    truncation_correction: false
+    truncation_extension_fraction: 0.1
+  alignment:
+    inherit_main: true
+    center_offset_pixels: 0.0
+    center_shift_sign: 1.0
+    center_offset_method: "detector_offset"
+    use_center_correction: true
+    use_drift_correction: true
+    drift_shift_file: null
+    estimate_drift: false
+    drift_units: "pixels_after_binning"
+    drift_stage: "transmission"
+    x_shift_sign: 1
+    y_shift_sign: 1
+    shift_interpretation_sign: 1
+    shift_interpolation_order: 1
+    shift_boundary_mode: "nearest"
+  exposure:
+    main_exposure_s: null
+    anchor_exposure_s: null
+    anchor_weight_multiplier: 1.0
+    max_weight_ratio: 10.0
+  split:
+    mode: "interleaved"
+    recon_count: null
+    tune_count: 6
+    qc_count: 6
+    random_seed: 23
+    use_tune_anchors_in_final: true
+    use_qc_anchors_in_final: false
+  merge:
+    duplicate_angle_tolerance_deg: 0.01
+    combine_duplicate_angles: true
+    sort_by_angle: true
+
+fdk_sweep:
+  enabled: true
+  lowres_factor: 2
+  filters: ["ram_lak", "shepp_logan", "cosine", "hann", "hamming"]
+  selection_filter: "auto"
+  cutoffs: [1.0]
+  metric_anchor_weight: 1.0
+  metric_tv_weight: 0.10
+  metric_negative_weight: 0.10
+  use_tune_anchors: true
+  detector_mask_path: null
+  save_candidate_previews: true
+
+prior:
+  enabled: true
+  method_order: ["tv"]
+  normalize_low_percentile: 0.5
+  normalize_high_percentile: 99.5
+  clip_min: -0.1
+  clip_max: 1.2
+  support_gaussian_sigma_voxels: 2.0
+  support_dilation_voxels: 8
+  noise_estimation: "highpass_mad"
+  noise_highpass_sigma_voxels: 1.5
+  tv_weights: [0.005, 0.01, 0.02, 0.04]
+  tv_epsilon: 1.0e-4
+  tv_iterations: 50
+  optional_bm4d_enabled: false
+  bm4d_sigma_multipliers: [0.5, 0.7, 1.0]
+  slab_depth: 96
+  slab_overlap: 12
+
+prior_scoring:
+  max_anchor_residual_ratio: 1.10
+  min_edge_retention: 0.85
+  max_correction_fraction: 0.15
+  choose_lowest_background_noise_among_valid: true
+
+confidence:
+  enabled: true
+  method: "correction_and_edge"
+  C_min: 0.05
+  C_max: 1.0
+  tau_delta_mode: "median_times_2"
+  tau_gradient_loss: 0.35
+  blur_sigma_voxels: 1.5
+
+mbir_lite:
+  enabled: true
+  solver: "anchored_streaming_subset_tv"
+  n_sweeps: 5
+  projection_batch_size: 32
+  ordered_subset_count: 8
+  lambda_tv: 1.0e-4
+  lambda_tv_mode: "absolute"
+  rho_prior: 0.05
+  rho_mode: "absolute"
+  rho_beta: 0.15
+  tv_epsilon: 1.0e-4
+  positivity: true
+  support_mask: true
+  subset_tv_power_iterations: 2
+  subset_tv_step_safety: 0.5
+  pdhg_chunk_slices: 16
+  use_projection_weights: true
+  stop_on_qc_anchor_residual: true
+  save_every: 1
+
+fast_recon:
+  enabled: true
+  output_subfolder: "fast_recon"
+  save_intermediate: true
+  make_qc_report: true
+  resume_run_folder: null

@@ -1,0 +1,16 @@
+numpy
+scipy
+pandas
+tifffile
+matplotlib
+PyYAML
+PySide6
+scikit-image
+pytest
+
+# Optional GPU TV operations:
+# cupy-cuda12x
+
+# CERN/TIGRE is not the unrelated PyPI package named "tigre".
+# Install with conda where possible:
+#   conda install -c ccpi tigre
