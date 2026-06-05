@@ -55,7 +55,7 @@ from ..mbir_debug import (
     mbir_debug_report_lines,
 )
 from ..device_monitor import format_gpu_snapshot_summary, nvidia_gpu_monitor_available, query_nvidia_gpu_snapshot
-from ..logging_utils import timestamp
+from ..logging_utils import append_text_line, timestamp
 from ..fast_pipeline import execute_fast_pipeline
 from ..output_manager import RunFolders
 from ..pipeline import execute_pipeline, extract_preview_slice_for_gui, preview_slice_counts_for_shape
@@ -109,6 +109,59 @@ class TomogramSource:
     label: str
     path: Path | None = None
     volume: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class MemoryEstimateRuntime:
+    system_info: Any | None
+    gpu_selection: Any
+    selected_gpu_infos: list[Any]
+    selected_gpu_count: int
+    selected_gpu_min_free_gb: float | None
+    selected_gpu_min_total_gb: float | None
+    selected_gpu_total_free_gb: float
+    selected_gpu_total_total_gb: float
+
+
+_TOMOGRAM_SOURCE_DISPLAY_ORDER = (
+    "fdk",
+    "existing_fdk",
+    "mbir",
+    "fast_fdk",
+    "fast_prior",
+    "mbir_lite",
+)
+
+
+def _tomogram_source_is_available(source: TomogramSource) -> bool:
+    return source.volume is not None or (source.path is not None and source.path.exists())
+
+
+def _append_tomogram_source(
+    sources: dict[str, TomogramSource],
+    source_id: str,
+    label: str,
+    *,
+    path: Path | None = None,
+    volume: np.ndarray | None = None,
+) -> None:
+    source = TomogramSource(str(label), path=Path(path) if path is not None else None, volume=volume)
+    if _tomogram_source_is_available(source):
+        sources[str(source_id)] = source
+
+
+def _merge_tomogram_source_maps(*source_maps: dict[str, TomogramSource]) -> dict[str, TomogramSource]:
+    merged: dict[str, TomogramSource] = {}
+    for source_id in _TOMOGRAM_SOURCE_DISPLAY_ORDER:
+        for source_map in source_maps:
+            source = source_map.get(source_id)
+            if source is not None and _tomogram_source_is_available(source):
+                merged[source_id] = source
+    for source_map in source_maps:
+        for source_id, source in source_map.items():
+            if source_id not in merged and _tomogram_source_is_available(source):
+                merged[str(source_id)] = source
+    return merged
 
 
 class CheckableComboBox(QComboBox):
@@ -229,6 +282,7 @@ class TVMBIRMainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._cancel = CancellationToken()
         self._last_result = None
+        self._active_run_root: Path | None = None
         self.metadata_frame = None
         self.validation: MetadataValidation | None = None
         self.expected_raw_shape: tuple[int, int] | None = None
@@ -524,6 +578,7 @@ class TVMBIRMainWindow(QMainWindow):
         group = QGroupBox("Image display")
         layout = QVBoxLayout(group)
         self.level_histogram = HistogramLevelWidget(self._preview_levels_changed)
+        self.level_histogram.setMinimumHeight(240)
         self.auto_level_button = QPushButton("Auto 1-99%")
         self.full_level_button = QPushButton("Full Range")
         self.zoom_in_button = QPushButton("Zoom In")
@@ -612,7 +667,13 @@ class TVMBIRMainWindow(QMainWindow):
         self.run_center_fine_button.setEnabled(False)
         self.center_preview_slider = QSlider(Qt.Horizontal)
         self.center_preview_slider.setRange(0, 0)
+        self.center_preview_slider.setSingleStep(1)
+        self.center_preview_slider.setPageStep(1)
         self.center_preview_slider.setEnabled(False)
+        self.center_preview_prev_button = QPushButton("<")
+        self.center_preview_prev_button.setEnabled(False)
+        self.center_preview_next_button = QPushButton(">")
+        self.center_preview_next_button.setEnabled(False)
         self.center_selected_label = QLabel("No center-offset previews")
         self.center_selected_label.setWordWrap(True)
         self.center_auto_label = QLabel("Automatic recommendation unavailable")
@@ -624,6 +685,10 @@ class TVMBIRMainWindow(QMainWindow):
         center_run_row = QHBoxLayout()
         center_run_row.addWidget(self.run_center_manual_button)
         center_run_row.addWidget(self.run_center_auto_button)
+        center_preview_row = QHBoxLayout()
+        center_preview_row.addWidget(self.center_preview_prev_button)
+        center_preview_row.addWidget(self.center_preview_slider, 1)
+        center_preview_row.addWidget(self.center_preview_next_button)
         center_apply_row = QHBoxLayout()
         center_apply_row.addWidget(self.apply_center_selected_button)
         center_apply_row.addWidget(self.apply_center_auto_button)
@@ -636,7 +701,7 @@ class TVMBIRMainWindow(QMainWindow):
         layout.addRow("Automatic metric", self.center_search_metric)
         layout.addRow(center_run_row)
         layout.addRow(self.run_center_fine_button)
-        layout.addRow("Preview selector", self.center_preview_slider)
+        layout.addRow("Preview selector", center_preview_row)
         layout.addRow(self.center_selected_label)
         layout.addRow(self.center_auto_label)
         layout.addRow(center_apply_row)
@@ -648,6 +713,8 @@ class TVMBIRMainWindow(QMainWindow):
         self.run_center_manual_button.clicked.connect(lambda: self.run_center_shift_search(automatic=False))
         self.run_center_auto_button.clicked.connect(lambda: self.run_center_shift_search(automatic=True))
         self.run_center_fine_button.clicked.connect(self.run_fine_center_shift_search)
+        self.center_preview_prev_button.clicked.connect(lambda: self._step_center_shift_preview(-1))
+        self.center_preview_next_button.clicked.connect(lambda: self._step_center_shift_preview(1))
         self.center_preview_slider.valueChanged.connect(self._center_shift_preview_changed)
         self.center_search_metric.currentIndexChanged.connect(self._update_auto_center_shift_recommendation)
         self.apply_center_selected_button.clicked.connect(self.apply_selected_center_shift)
@@ -759,6 +826,9 @@ class TVMBIRMainWindow(QMainWindow):
         self.fast_mbir_sweeps = self._spin(1, 1000, 5)
         self.fast_mbir_batch_size = self._spin(1, 1000000, 32)
         self.fast_mbir_subsets = self._spin(1, 1000000, 8)
+        self.fast_mbir_start_mode = QComboBox()
+        self.fast_mbir_start_mode.addItem("Fresh from FDK (reproducible rerun)", "fresh_from_fdk")
+        self.fast_mbir_start_mode.addItem("Resume previous MBIR-lite final", "resume_previous_final")
         self.fast_lambda_tv = self._double(0.0, 1000.0, 1.0e-4, 8)
         self.fast_rho_prior = self._double(0.0, 1000.0, 0.05, 6)
         self.fast_resume_run_folder = PathPicker("folder")
@@ -805,6 +875,7 @@ class TVMBIRMainWindow(QMainWindow):
         layout.addRow("MBIR-lite sweeps", self.fast_mbir_sweeps)
         layout.addRow("MBIR-lite batch size", self.fast_mbir_batch_size)
         layout.addRow("MBIR-lite subsets", self.fast_mbir_subsets)
+        layout.addRow("MBIR-lite start volume", self.fast_mbir_start_mode)
         layout.addRow("MBIR-lite lambda TV", self.fast_lambda_tv)
         layout.addRow("MBIR-lite rho prior", self.fast_rho_prior)
         layout.addRow("Resume run folder", self.fast_resume_run_folder)
@@ -952,6 +1023,7 @@ class TVMBIRMainWindow(QMainWindow):
         cfg.mbir_lite.n_sweeps = self.fast_mbir_sweeps.value()
         cfg.mbir_lite.projection_batch_size = self.fast_mbir_batch_size.value()
         cfg.mbir_lite.ordered_subset_count = self.fast_mbir_subsets.value()
+        cfg.mbir_lite.start_mode = str(self.fast_mbir_start_mode.currentData() or "fresh_from_fdk")
         cfg.mbir_lite.lambda_tv = self.fast_lambda_tv.value()
         cfg.mbir_lite.rho_prior = self.fast_rho_prior.value()
         cfg.fast_recon.enabled = self.fast_enabled.isChecked()
@@ -1062,6 +1134,7 @@ class TVMBIRMainWindow(QMainWindow):
         self.fast_mbir_sweeps.setValue(cfg.mbir_lite.n_sweeps)
         self.fast_mbir_batch_size.setValue(cfg.mbir_lite.projection_batch_size)
         self.fast_mbir_subsets.setValue(cfg.mbir_lite.ordered_subset_count)
+        self._set_combo_by_data(self.fast_mbir_start_mode, getattr(cfg.mbir_lite, "start_mode", "fresh_from_fdk") or "fresh_from_fdk")
         self.fast_lambda_tv.setValue(cfg.mbir_lite.lambda_tv)
         self.fast_rho_prior.setValue(cfg.mbir_lite.rho_prior)
         self.fast_resume_run_folder.setText(cfg.fast_recon.resume_run_folder or "")
@@ -1401,8 +1474,8 @@ class TVMBIRMainWindow(QMainWindow):
         self.transmission_stack = None
         self.attenuation_stack = None
 
-    def _show_preview_image(self, image: np.ndarray | None, title: str) -> None:
-        self.preview.show_image(image, title)
+    def _show_preview_image(self, image: np.ndarray | None, title: str, preserve_zoom: bool = False) -> None:
+        self.preview.show_image(image, title, preserve_zoom=preserve_zoom)
         self.tabs.setCurrentWidget(self.preview)
         self._active_image_changed()
 
@@ -1418,15 +1491,17 @@ class TVMBIRMainWindow(QMainWindow):
         self,
         sources: dict[str, TomogramSource],
         selected_id: str | None = None,
+        *,
+        replace: bool = False,
     ) -> None:
-        available: dict[str, TomogramSource] = {}
-        for source_id, source in sources.items():
-            if source.volume is not None or (source.path is not None and source.path.exists()):
-                available[str(source_id)] = source
+        source_maps = [sources] if replace else [self._tomogram_sources, sources]
+        available = _merge_tomogram_source_maps(*source_maps)
         self._tomogram_sources = available
+        current_id = self.tomogram_view.current_tomogram_source_id()
+        target_id = selected_id if selected_id in available else current_id if current_id in available else None
         self.tomogram_view.set_tomogram_choices(
             [(source_id, source.label) for source_id, source in available.items()],
-            selected_id=selected_id if selected_id in available else None,
+            selected_id=target_id,
         )
 
     def _tomogram_source_selected(self, source_id: str) -> None:
@@ -1466,27 +1541,81 @@ class TVMBIRMainWindow(QMainWindow):
 
     def _tomogram_sources_from_result(self, result) -> dict[str, TomogramSource]:
         folders = getattr(result, "run_folders", None)
-        sources: dict[str, TomogramSource] = {}
-        if folders is None:
-            return sources
+        path_sources = self._tomogram_sources_from_run_root(Path(folders.root)) if folders is not None else {}
+        live_sources: dict[str, TomogramSource] = {}
+        explicit_sources: dict[str, TomogramSource] = {}
 
-        fdk_path = Path(folders.fdk) / "fdk_initial_volume.npy"
-        mbir_path = Path(folders.mbir) / "mbir_final_volume.npy"
-        fast_fdk_path = Path(folders.fast_fdk_sweep) / "fdk_best.npy"
-        fast_prior_path = Path(folders.fast_prior) / "prior_selected.npy"
-        fast_mbir_path = Path(folders.fast_mbir_lite) / "mbir_lite_final.npy"
+        fdk_path = Path(folders.fdk) / "fdk_initial_volume.npy" if folders is not None else None
+        mbir_path = Path(folders.mbir) / "mbir_final_volume.npy" if folders is not None else None
+        fast_fdk_path = Path(folders.fast_fdk_sweep) / "fdk_best.npy" if folders is not None else None
+        fast_prior_path = Path(folders.fast_prior) / "prior_selected.npy" if folders is not None else None
+        fast_mbir_path = Path(folders.fast_mbir_lite) / "mbir_lite_final.npy" if folders is not None else None
 
-        if getattr(result, "fdk_volume", None) is not None or fdk_path.exists():
-            sources["fdk"] = TomogramSource("FDK reconstruction", path=fdk_path)
-        if getattr(result, "mbir_result", None) is not None or mbir_path.exists():
-            sources["mbir"] = TomogramSource("TomoAnchor MBIR final", path=mbir_path)
-        if getattr(result, "fdk_sweep_result", None) is not None or fast_fdk_path.exists():
-            sources["fast_fdk"] = TomogramSource("Fast FDK reconstruction", path=fast_fdk_path)
-        if getattr(result, "prior_result", None) is not None or fast_prior_path.exists():
-            sources["fast_prior"] = TomogramSource("Fast prior", path=fast_prior_path)
-        if getattr(result, "mbir_lite_result", None) is not None or fast_mbir_path.exists():
-            sources["mbir_lite"] = TomogramSource("MBIR-lite final", path=fast_mbir_path)
-        return sources
+        _append_tomogram_source(
+            live_sources,
+            "fdk",
+            "FDK reconstruction",
+            path=fdk_path,
+            volume=getattr(result, "fdk_volume", None),
+        )
+        _append_tomogram_source(
+            live_sources,
+            "mbir",
+            "TomoAnchor MBIR final",
+            path=mbir_path,
+            volume=getattr(getattr(result, "mbir_result", None), "volume", None),
+        )
+        _append_tomogram_source(
+            live_sources,
+            "fast_fdk",
+            "Fast FDK reconstruction",
+            path=fast_fdk_path,
+            volume=getattr(getattr(result, "fdk_sweep_result", None), "best_volume", None),
+        )
+        _append_tomogram_source(
+            live_sources,
+            "fast_prior",
+            "Fast prior",
+            path=fast_prior_path,
+            volume=getattr(getattr(result, "prior_result", None), "x_prior", None),
+        )
+        _append_tomogram_source(
+            live_sources,
+            "mbir_lite",
+            "MBIR-lite final",
+            path=fast_mbir_path,
+            volume=getattr(getattr(result, "mbir_lite_result", None), "volume", None),
+        )
+
+        try:
+            cfg = self.config_from_ui()
+        except Exception:
+            cfg = None
+        explicit_fdk_path = (
+            Path(cfg.initialization.fdk_volume_path)
+            if cfg is not None and cfg.initialization.fdk_volume_path
+            else None
+        )
+        if explicit_fdk_path is not None and explicit_fdk_path.exists():
+            normalized_fdk_path = None
+            if fdk_path is not None and fdk_path.exists():
+                try:
+                    normalized_fdk_path = fdk_path.resolve()
+                except Exception:
+                    normalized_fdk_path = fdk_path
+            try:
+                normalized_explicit = explicit_fdk_path.resolve()
+            except Exception:
+                normalized_explicit = explicit_fdk_path
+            if normalized_fdk_path is None or normalized_explicit != normalized_fdk_path:
+                _append_tomogram_source(
+                    explicit_sources,
+                    "existing_fdk",
+                    "Existing FDK volume",
+                    path=explicit_fdk_path,
+                )
+
+        return _merge_tomogram_source_maps(path_sources, explicit_sources, live_sources)
 
     def _preload_existing_results(self) -> None:
         if self._thread is not None:
@@ -1538,7 +1667,7 @@ class TVMBIRMainWindow(QMainWindow):
 
         if loaded_sources:
             preferred_tomogram_id = self._preferred_tomogram_id(loaded_sources)
-            self._set_tomogram_sources(loaded_sources, preferred_tomogram_id)
+            self._set_tomogram_sources(loaded_sources, preferred_tomogram_id, replace=True)
             if preferred_tomogram_id is not None:
                 self._load_tomogram_source(preferred_tomogram_id, switch_to_tab=False, preserve_view_state=False)
             loaded_parts.append(f"{len(loaded_sources)} tomogram source(s)")
@@ -2044,11 +2173,24 @@ class TVMBIRMainWindow(QMainWindow):
         self._show_selected_center_shift_preview()
         self._refresh_center_shift_metric_plot()
 
+    def _step_center_shift_preview(self, step: int) -> None:
+        if not self.center_shift_results:
+            return
+        current = self.center_preview_slider.value()
+        maximum = max(0, len(self.center_shift_results) - 1)
+        target = min(max(int(current) + int(step), 0), maximum)
+        if target != current:
+            self.center_preview_slider.setValue(target)
+
     def _show_selected_center_shift_preview(self) -> None:
         result = self._selected_center_shift_result()
         if result is None:
             return
-        self._show_preview_image(result.preview_image, f"Center offset preview: {result.shift_px:.4f} px")
+        self._show_preview_image(
+            result.preview_image,
+            f"Center offset preview: {result.shift_px:.4f} px",
+            preserve_zoom=True,
+        )
 
     def _selected_center_shift_result(self) -> CenterShiftPreviewResult | None:
         if not self.center_shift_results:
@@ -2060,6 +2202,10 @@ class TVMBIRMainWindow(QMainWindow):
         result = self._selected_center_shift_result()
         has_results = result is not None
         self.center_preview_slider.setEnabled(has_results)
+        self.center_preview_prev_button.setEnabled(has_results and self.current_center_shift_preview_index > 0)
+        self.center_preview_next_button.setEnabled(
+            has_results and self.current_center_shift_preview_index < len(self.center_shift_results) - 1
+        )
         self.apply_center_selected_button.setEnabled(has_results)
         self.run_center_fine_button.setEnabled(has_results)
         self.apply_center_auto_button.setEnabled(self.auto_best_shift_px is not None)
@@ -2343,159 +2489,237 @@ class TVMBIRMainWindow(QMainWindow):
     def _estimate_mbir_lite_memory(self) -> None:
         cfg = self.config_from_ui()
         try:
-            validation, detector_shape_pre_tigre = self._main_validation_for_estimate(cfg)
-            configured_volume_shape = (int(self.nz.value()), int(self.ny.value()), int(self.nx.value()))
-            if min(configured_volume_shape) <= 0:
-                raise ValueError("Set positive Nz, Ny, and Nx before estimating MBIR-lite memory.")
-            transpose_for_tigre = bool(cfg.preprocessing.transpose_for_tigre)
-            detector_shape = (detector_shape_pre_tigre[1], detector_shape_pre_tigre[0]) if transpose_for_tigre else detector_shape_pre_tigre
-            volume_shape = configured_volume_shape
-            main_views = len(validation.records)
-            anchor_total, anchor_final, anchor_lines = self._estimate_anchor_views_for_mbir_lite(cfg)
-            total_views = max(1, int(main_views) + int(anchor_final))
-            subset_count = max(1, int(cfg.mbir_lite.ordered_subset_count))
-            batch_size = max(1, int(cfg.mbir_lite.projection_batch_size))
-            active_subset_views = max(1, int(math.ceil(total_views / float(subset_count))))
-            batches_per_sweep = max(1, int(math.ceil(active_subset_views / float(batch_size))))
-
-            detected_gpu_infos = query_all_nvidia_gpu_memory() if cfg.gpu.use_gpu else []
-            gpu_selection = resolve_gpu_selection(
-                cfg.gpu.use_gpu,
-                cfg.gpu.gpu_selector,
-                cfg.gpu.gpu_id,
-                [info.gpu_id for info in detected_gpu_infos],
-            )
-            selected_gpu_infos = [info for info in detected_gpu_infos if info.gpu_id in gpu_selection.gpu_ids]
-            selected_gpu_count = max(1, len(gpu_selection.gpu_ids)) if cfg.gpu.use_gpu else 1
-            selected_gpu_min_free_gb = min((info.free_gb for info in selected_gpu_infos), default=None)
-            selected_gpu_min_total_gb = min((info.total_gb for info in selected_gpu_infos), default=None)
-            selected_gpu_total_free_gb = sum(info.free_gb for info in selected_gpu_infos)
-            selected_gpu_total_total_gb = sum(info.total_gb for info in selected_gpu_infos)
-
-            full_estimate = estimate_mbir_memory(total_views, detector_shape, volume_shape, gpu_count=selected_gpu_count)
-            subset_estimate = estimate_mbir_memory(
-                active_subset_views,
-                detector_shape,
-                volume_shape,
-                projection_batch_size=batch_size,
-                gpu_count=selected_gpu_count,
-            )
-            full_projection_gb = full_estimate.projection_gb
-            active_subset_projection_gb = estimate_mbir_memory(
-                active_subset_views,
-                detector_shape,
-                volume_shape,
-                gpu_count=selected_gpu_count,
-            ).projection_gb
-            volume_gb = full_estimate.volume_gb
-            mbir_lite_ram_gb = 4.85 * volume_gb + 1.25 * full_projection_gb
-            min_available_ram_gb = max(4.0, 2.0 * volume_gb + full_projection_gb)
-            system_info = query_system_memory()
-            effective_gpu_views = _estimated_tigre_effective_views(active_subset_views, batch_size)
-
+            runtime = self._memory_estimate_runtime(cfg)
             lines = [
-                "MBIR-lite memory estimate",
-                "-------------------------",
-                "This is a fresh estimate from the current GUI settings. It does not start a reconstruction.",
+                *self._standard_mbir_memory_overview_lines(cfg, runtime),
                 "",
-                f"Main projection views: {main_views}",
-                f"Anchor views in metadata: {anchor_total}",
-                f"Anchor views included in MBIR-lite: {anchor_final}",
-                *anchor_lines,
-                f"Total MBIR-lite data views: {total_views}",
+                *self._mbir_lite_memory_overview_lines(cfg, runtime),
                 "",
-                f"Detector rows x cols for TIGRE: {detector_shape[0]} x {detector_shape[1]}",
-                f"Volume voxels z/y/x: {volume_shape[0]} x {volume_shape[1]} x {volume_shape[2]}",
-                f"Single volume float32: {volume_gb:.2f} GB",
-                f"Resident full projection stack float32: {full_projection_gb:.2f} GB",
+                *self._memory_estimate_machine_lines(cfg, runtime),
                 "",
-                f"MBIR-lite subsets: {subset_count}",
-                f"MBIR-lite batch size: {batch_size}",
-                f"Active views per sweep/subset: about {active_subset_views}",
-                f"TIGRE batches per sweep: about {batches_per_sweep}",
-                f"Active subset projection stack float32: {active_subset_projection_gb:.2f} GB",
-                f"Estimated TIGRE GPU views at peak: about {effective_gpu_views}",
-                "",
-                f"Estimated MBIR-lite system RAM working set: {mbir_lite_ram_gb:.2f} GB",
-                f"Minimum available RAM before TIGRE calls: {min_available_ram_gb:.2f} GB",
-                f"Estimated TIGRE GPU operator peak: {subset_estimate.gpu_operator_estimate_gb:.2f} GB",
-                "",
-                "RAM estimate includes the current volume, prior, confidence map, gradient/backprojection buffers, and the resident projection stack.",
-                "The resident projection stack uses all MBIR-lite data views; changing subsets or batch size mostly changes transient update/GPU pressure.",
-                f"TIGRE may reserve internal buffers; the estimator keeps a {TIGRE_BACKPROJECTION_KERNEL_VIEWS}-view kernel floor when relevant.",
+                "Notes",
+                "-----",
+                "Standard MBIR RAM is the full-run estimate for the current MBIR settings.",
+                "MBIR-lite RAM uses the current anchor, subset, and batch settings.",
+                "TIGRE GPU peak is the estimated peak for one Ax/Atb call, not the full host RAM working set.",
+                "Run MBIR still performs a stricter preflight RAM/VRAM safety check before reconstruction starts.",
             ]
-            lines.extend(gpu_selection.warnings)
-
-            if system_info is not None:
-                lines.extend(
-                    [
-                        "",
-                        f"System RAM available/total now: {system_info.available_gb:.2f} / {system_info.total_gb:.2f} GB",
-                    ]
-                )
-                if mbir_lite_ram_gb > SYSTEM_RAM_SAFETY_FRACTION * system_info.total_gb:
-                    lines.append("Warning: estimated MBIR-lite RAM exceeds the safe physical RAM budget.")
-                elif system_info.available_gb < min_available_ram_gb:
-                    lines.append("Warning: currently available RAM is low for TIGRE host buffers; close memory-heavy applications.")
-                elif mbir_lite_ram_gb > 0.70 * system_info.total_gb:
-                    lines.append("Caution: estimated MBIR-lite RAM uses a large fraction of physical memory.")
-            else:
-                lines.extend(["", "System RAM could not be queried."])
-
-            if selected_gpu_infos:
-                lines.extend(
-                    [
-                        "",
-                        f"Selected GPU count: {len(selected_gpu_infos)}",
-                        "Selected GPUs: " + ", ".join(f"{info.gpu_id}: {info.name}" for info in selected_gpu_infos),
-                        f"Aggregate selected GPU memory free/total now: {selected_gpu_total_free_gb:.2f} / {selected_gpu_total_total_gb:.2f} GB",
-                        f"Minimum per-GPU free/total now: {selected_gpu_min_free_gb:.2f} / {selected_gpu_min_total_gb:.2f} GB",
-                    ]
-                )
-                if selected_gpu_min_free_gb is not None and subset_estimate.gpu_operator_estimate_gb > 0.85 * selected_gpu_min_free_gb:
-                    lines.append("Warning: estimated TIGRE GPU peak is close to or above currently free VRAM.")
-                if selected_gpu_min_total_gb is not None and subset_estimate.gpu_operator_estimate_gb > 0.98 * selected_gpu_min_total_gb:
-                    lines.append("Critical: estimated TIGRE GPU peak is near or above total VRAM.")
-                if selected_gpu_min_free_gb is not None:
-                    recommended_batch = recommended_projection_batch_size(
-                        active_subset_views,
-                        detector_shape,
-                        volume_shape,
-                        selected_gpu_min_free_gb,
-                        gpu_count=selected_gpu_count,
-                    )
-                    lines.append(f"Estimated memory-safe batch size for the active subset: up to about {recommended_batch}")
-                    if recommended_batch < batch_size:
-                        lines.append(f"Suggestion: lower MBIR-lite batch size from {batch_size} to {recommended_batch} or less.")
-            elif cfg.gpu.use_gpu:
-                lines.extend(["", "Selected GPU memory could not be queried with nvidia-smi."])
-            else:
-                lines.extend(["", "GPU acceleration is disabled; VRAM estimate is informational only."])
-
-            lines.extend(["", "Tuning guide:"])
-            if active_subset_views > batch_size:
-                lines.append("- Lower batch size first if VRAM is tight; this reduces views per TIGRE call.")
-            else:
-                lines.append("- The active subset is no larger than the batch size, so lowering batch size may not reduce the estimated TIGRE peak much.")
-            lines.append("- Increase subsets to reduce active views per sweep and GPU pressure; lower subsets for steadier but heavier sweeps.")
-            lines.append("- Reduce volume voxels or crop the ROI if volume memory dominates.")
-            lines.append("- Close other GPU/RAM-heavy applications before running near the limit.")
-
-            summary = (
-                f"Estimated MBIR-lite RAM {mbir_lite_ram_gb:.2f} GB; "
-                f"GPU peak {subset_estimate.gpu_operator_estimate_gb:.2f} GB; "
-                f"{active_subset_views} active views/sweep in {batches_per_sweep} batch(es)."
-            )
             self._show_memory_details_dialog(
-                "MBIR-lite Memory Estimate",
-                summary,
-                "Adjust MBIR-lite batch size, subsets, volume size, or GPU selection, then press Estimate Memory again for a fresh calculation.",
+                "Memory Estimate Overview",
+                "This overview includes both standard MBIR and MBIR-lite using the current GUI settings.",
+                "Use the Standard MBIR section for a full MBIR run and the MBIR-lite section for the fast anchor-guided workflow.",
                 lines,
                 critical=False,
                 ask=False,
             )
         except Exception as exc:
             self._error("Memory estimate unavailable", str(exc))
+
+    def _memory_estimate_runtime(self, cfg: AppConfig) -> MemoryEstimateRuntime:
+        detected_gpu_infos = query_all_nvidia_gpu_memory() if cfg.gpu.use_gpu else []
+        gpu_selection = resolve_gpu_selection(
+            cfg.gpu.use_gpu,
+            cfg.gpu.gpu_selector,
+            cfg.gpu.gpu_id,
+            [info.gpu_id for info in detected_gpu_infos],
+        )
+        selected_gpu_infos = [info for info in detected_gpu_infos if info.gpu_id in gpu_selection.gpu_ids]
+        return MemoryEstimateRuntime(
+            system_info=query_system_memory(),
+            gpu_selection=gpu_selection,
+            selected_gpu_infos=selected_gpu_infos,
+            selected_gpu_count=max(1, len(gpu_selection.gpu_ids)) if cfg.gpu.use_gpu else 1,
+            selected_gpu_min_free_gb=min((info.free_gb for info in selected_gpu_infos), default=None),
+            selected_gpu_min_total_gb=min((info.total_gb for info in selected_gpu_infos), default=None),
+            selected_gpu_total_free_gb=sum(info.free_gb for info in selected_gpu_infos),
+            selected_gpu_total_total_gb=sum(info.total_gb for info in selected_gpu_infos),
+        )
+
+    def _standard_mbir_memory_overview_lines(
+        self,
+        cfg: AppConfig,
+        runtime: MemoryEstimateRuntime,
+    ) -> list[str]:
+        validation, detector_shape_pre_tigre = self._main_validation_for_estimate(cfg)
+        configured_volume_shape = (int(self.nz.value()), int(self.ny.value()), int(self.nx.value()))
+        if min(configured_volume_shape) <= 0:
+            raise ValueError("Set positive Nz, Ny, and Nx before estimating standard MBIR memory.")
+        transpose_for_tigre = bool(cfg.preprocessing.transpose_for_tigre)
+        base_detector_shape = (
+            (detector_shape_pre_tigre[1], detector_shape_pre_tigre[0])
+            if transpose_for_tigre
+            else detector_shape_pre_tigre
+        )
+        projection_count = effective_projection_count(len(validation.records), cfg.mbir.projection_stride)
+        detector_shape = effective_detector_shape(
+            base_detector_shape,
+            cfg.mbir.debug_pixel_binning,
+            transpose_for_tigre=transpose_for_tigre,
+        )
+        volume_shape = effective_volume_shape(
+            configured_volume_shape,
+            cfg.mbir.debug_pixel_binning,
+            transpose_for_tigre=transpose_for_tigre,
+        )
+        requested_memory_mode = str(cfg.mbir.memory_mode or "auto").strip().lower()
+        streaming_mode = requested_memory_mode in {"auto", "projection_streaming", "ordered_subsets"}
+        estimate = estimate_mbir_memory(
+            projection_count,
+            detector_shape,
+            volume_shape,
+            projection_batch_size=cfg.mbir.projection_batch_size if streaming_mode else None,
+            gpu_count=runtime.selected_gpu_count,
+        )
+        low_memory_cpu_gb = estimate_low_memory_pdhg_cpu_gb(
+            estimate.projection_gb,
+            estimate.volume_gb,
+            dual_dtype=cfg.mbir.pdhg_dual_dtype,
+        )
+        subset_tv_cpu_gb = estimate_streaming_subset_tv_cpu_gb(estimate.projection_gb, estimate.volume_gb)
+        effective_solver = self._effective_auto_mbir_solver(
+            cfg,
+            estimate,
+            low_memory_cpu_gb,
+            subset_tv_cpu_gb,
+            runtime.system_info,
+        )
+        batch_text = (
+            f"Projection-streaming GPU estimate uses batch size {max(1, int(cfg.mbir.projection_batch_size))}"
+            if streaming_mode
+            else f"GPU estimate uses the full per-call projection stack for memory mode {cfg.mbir.memory_mode}"
+        )
+        lines = [
+            "Standard MBIR",
+            "-------------",
+            f"Projection views: {projection_count}",
+            f"Detector rows x cols: {detector_shape[0]} x {detector_shape[1]}",
+            f"Volume voxels z/y/x: {volume_shape[0]} x {volume_shape[1]} x {volume_shape[2]}",
+            f"Resident data: projection stack {estimate.projection_gb:.2f} GB | single volume {estimate.volume_gb:.2f} GB",
+            f"Estimated system RAM: ADMM/CG {estimate.cpu_working_set_gb:.2f} GB | PDHG {low_memory_cpu_gb:.2f} GB | subset-TV {subset_tv_cpu_gb:.2f} GB",
+            f"Estimated TIGRE GPU peak: {estimate.gpu_operator_estimate_gb:.2f} GB",
+            f"Solver setting: {cfg.mbir.solver} | auto would likely use {_solver_display_name(effective_solver)}",
+            batch_text,
+        ]
+        debug_binning = tuple(int(value) for value in cfg.mbir.debug_pixel_binning)
+        if debug_binning != (1, 1) or int(cfg.mbir.projection_stride) > 1:
+            lines.append(
+                f"Debug estimate modifiers included: projection stride {int(cfg.mbir.projection_stride)}, binning {debug_binning[0]} x {debug_binning[1]}"
+            )
+        return lines
+
+    def _mbir_lite_memory_overview_lines(
+        self,
+        cfg: AppConfig,
+        runtime: MemoryEstimateRuntime,
+    ) -> list[str]:
+        validation, detector_shape_pre_tigre = self._main_validation_for_estimate(cfg)
+        configured_volume_shape = (int(self.nz.value()), int(self.ny.value()), int(self.nx.value()))
+        if min(configured_volume_shape) <= 0:
+            raise ValueError("Set positive Nz, Ny, and Nx before estimating MBIR-lite memory.")
+        transpose_for_tigre = bool(cfg.preprocessing.transpose_for_tigre)
+        detector_shape = (
+            (detector_shape_pre_tigre[1], detector_shape_pre_tigre[0])
+            if transpose_for_tigre
+            else detector_shape_pre_tigre
+        )
+        volume_shape = configured_volume_shape
+        main_views = len(validation.records)
+        anchor_total, anchor_final, anchor_lines = self._estimate_anchor_views_for_mbir_lite(cfg)
+        total_views = max(1, int(main_views) + int(anchor_final))
+        subset_count = max(1, int(cfg.mbir_lite.ordered_subset_count))
+        batch_size = max(1, int(cfg.mbir_lite.projection_batch_size))
+        active_subset_views = max(1, int(math.ceil(total_views / float(subset_count))))
+        batches_per_sweep = max(1, int(math.ceil(active_subset_views / float(batch_size))))
+        full_estimate = estimate_mbir_memory(
+            total_views,
+            detector_shape,
+            volume_shape,
+            gpu_count=runtime.selected_gpu_count,
+        )
+        subset_estimate = estimate_mbir_memory(
+            active_subset_views,
+            detector_shape,
+            volume_shape,
+            projection_batch_size=batch_size,
+            gpu_count=runtime.selected_gpu_count,
+        )
+        active_subset_projection_gb = estimate_mbir_memory(
+            active_subset_views,
+            detector_shape,
+            volume_shape,
+            gpu_count=runtime.selected_gpu_count,
+        ).projection_gb
+        mbir_lite_ram_gb = 4.85 * full_estimate.volume_gb + 1.25 * full_estimate.projection_gb
+        min_available_ram_gb = max(4.0, 2.0 * full_estimate.volume_gb + full_estimate.projection_gb)
+        effective_gpu_views = _estimated_tigre_effective_views(active_subset_views, batch_size)
+        lines = [
+            "MBIR-lite",
+            "---------",
+            f"Main views: {main_views} | anchor views in metadata: {anchor_total} | anchor views used: {anchor_final}",
+            *anchor_lines,
+            f"Total MBIR-lite views: {total_views}",
+            f"Detector rows x cols: {detector_shape[0]} x {detector_shape[1]}",
+            f"Volume voxels z/y/x: {volume_shape[0]} x {volume_shape[1]} x {volume_shape[2]}",
+            f"Resident data: full projection stack {full_estimate.projection_gb:.2f} GB | single volume {full_estimate.volume_gb:.2f} GB",
+            f"Subsets {subset_count} | batch size {batch_size} | active views/sweep about {active_subset_views} | batches/sweep about {batches_per_sweep}",
+            f"Active-subset projection stack: {active_subset_projection_gb:.2f} GB | estimated TIGRE views at peak: about {effective_gpu_views}",
+            f"Estimated system RAM: {mbir_lite_ram_gb:.2f} GB",
+            f"Minimum RAM before TIGRE calls: {min_available_ram_gb:.2f} GB",
+            f"Estimated TIGRE GPU peak: {subset_estimate.gpu_operator_estimate_gb:.2f} GB",
+        ]
+        return lines
+
+    def _memory_estimate_machine_lines(
+        self,
+        cfg: AppConfig,
+        runtime: MemoryEstimateRuntime,
+    ) -> list[str]:
+        lines = [
+            "Current Machine",
+            "---------------",
+            f"GPU selection: {runtime.gpu_selection.describe()} (selector='{runtime.gpu_selection.selector}')",
+        ]
+        if runtime.system_info is not None:
+            lines.append(
+                f"System RAM available/total: {runtime.system_info.available_gb:.2f} / {runtime.system_info.total_gb:.2f} GB"
+            )
+        else:
+            lines.append("System RAM available/total: unavailable")
+        if runtime.selected_gpu_infos:
+            lines.extend(
+                [
+                    f"Selected GPU count: {len(runtime.selected_gpu_infos)}",
+                    "Selected GPUs: " + ", ".join(f"{info.gpu_id}: {info.name}" for info in runtime.selected_gpu_infos),
+                    f"Aggregate selected GPU VRAM free/total: {runtime.selected_gpu_total_free_gb:.2f} / {runtime.selected_gpu_total_total_gb:.2f} GB",
+                    f"Minimum per-GPU VRAM free/total: {runtime.selected_gpu_min_free_gb:.2f} / {runtime.selected_gpu_min_total_gb:.2f} GB",
+                ]
+            )
+        elif cfg.gpu.use_gpu:
+            lines.append("Selected GPU VRAM: unavailable from nvidia-smi")
+        else:
+            lines.append("GPU acceleration is disabled; VRAM numbers are informational only")
+        lines.extend(str(warning) for warning in runtime.gpu_selection.warnings)
+        return lines
+
+    def _effective_auto_mbir_solver(
+        self,
+        cfg: AppConfig,
+        estimate,
+        low_memory_cpu_gb: float,
+        subset_tv_cpu_gb: float,
+        system_info,
+    ) -> str:
+        effective_solver = _normalize_solver_name(cfg.mbir.solver)
+        if effective_solver != "auto":
+            return effective_solver
+        effective_solver = "admm"
+        if system_info is not None and estimate.cpu_working_set_gb > SYSTEM_RAM_SAFETY_FRACTION * system_info.total_gb:
+            effective_solver = "pdhg_low_memory"
+        elif system_info is not None and system_info.available_gb < minimum_available_system_memory_gb(estimate):
+            effective_solver = "pdhg_low_memory"
+        if system_info is not None and effective_solver == "pdhg_low_memory" and low_memory_cpu_gb > 0.65 * system_info.total_gb:
+            effective_solver = "streaming_subset_tv"
+        return effective_solver
 
     def _main_validation_for_estimate(self, cfg: AppConfig) -> tuple[MetadataValidation, tuple[int, int]]:
         if self.metadata_frame is None:
@@ -2951,7 +3175,7 @@ class TVMBIRMainWindow(QMainWindow):
         success = on_success or self._worker_success
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.log.connect(self._log)
+        worker.log.connect(self._worker_log)
         if on_progress is not None:
             worker.progress.connect(on_progress)
         worker.finished.connect(success)
@@ -3199,17 +3423,42 @@ class TVMBIRMainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
 
-    def _log(self, message: str) -> None:
+    def _display_log_message(self, message: str) -> None:
         self.log_text.append(message)
         self.statusBar().showMessage(message[-180:])
         self._update_metrics_run_folder_from_log(message)
 
+    def _worker_log(self, message: str) -> None:
+        self._display_log_message(message)
+
+    def _log(self, message: str) -> None:
+        self._display_log_message(message)
+        self._append_active_run_log(message)
+
+    def _append_active_run_log(self, message: str) -> None:
+        if self._active_run_root is None:
+            return
+        line = str(message).rstrip("\r\n")
+        if not line:
+            return
+        try:
+            append_text_line(self._active_run_root / "log.txt", line)
+        except Exception:
+            pass
+
     def _update_metrics_run_folder_from_log(self, message: str) -> None:
-        prefixes = ("Created fast run folder:", "Resuming fast run folder:")
+        prefixes = (
+            "Created run folder:",
+            "Created fast run folder:",
+            "Resuming fast run folder:",
+            "Run finished. Output:",
+            "Run cancelled. Partial output folder:",
+        )
         for prefix in prefixes:
             if prefix in message:
                 folder = message.split(prefix, 1)[1].strip()
                 if folder:
+                    self._active_run_root = Path(folder)
                     self.metrics_plot.set_run_folder(folder)
                 return
 

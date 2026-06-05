@@ -79,10 +79,15 @@ def execute_fast_pipeline(
     if requested_stage_only and resume_folder is None:
         raise ValueError("Stage-only fast commands require --fast-run-folder or fast_recon.resume_run_folder.")
 
-    log = MemoryLog(callback=logger, verbose=logger is None and config.logging.verbose)
     folders = _resolve_run_folders(config, resume_folder)
+    output = OutputManager(config.input.output_folder or "output")
+    output.save_config(folders, config)
+    log = MemoryLog(
+        callback=logger,
+        verbose=logger is None and config.logging.verbose,
+        persist_path=folders.root / "log.txt",
+    )
     if resume_folder is None:
-        OutputManager(config.input.output_folder or "output").save_config(folders, config)
         log.write(f"Created fast run folder: {folders.root}")
     else:
         log.write(f"Resuming fast run folder: {folders.root}")
@@ -182,6 +187,7 @@ def execute_fast_pipeline(
         if prior_result is None:
             prior_result = _load_prior_result_required(folders)
         fdk_volume = fdk_result.best_volume if fdk_result is not None else _load_optional_volume(folders.fast_fdk_sweep / "fdk_best.npy")
+        mbir_initial_volume, mbir_initial_label = _load_mbir_lite_initial_volume(folders, config, fdk_volume, prior_result)
         projections, angles, weights = _build_mbir_lite_stack(main_set, anchor_set, anchor_split, config)
         qc_data = _anchor_validation_data(anchor_set, anchor_split.qc_indices, "qc") if anchor_set is not None and anchor_split is not None else None
         operator = TigreConeBeamOperator(
@@ -221,7 +227,8 @@ def execute_fast_pipeline(
                 progress_callback=mbir_lite_progress_callback,
                 cancel_check=cancel_check,
             )
-            mbir_result = solver.reconstruct(projections, x0=fdk_volume if fdk_volume is not None else prior_result.x_prior)
+            log.write(f"MBIR-lite start mode: {mbir_initial_label}.")
+            mbir_result = solver.reconstruct(projections, x0=mbir_initial_volume)
         finally:
             operator.close()
             if qc_operator is not None:
@@ -250,8 +257,6 @@ def execute_fast_pipeline(
             log.write,
             cancel_check,
         )
-    output = OutputManager(config.input.output_folder or "output")
-    output.save_log(folders, log.lines)
     return FastPipelineResult(folders, main_set, anchor_set, anchor_split, fdk_result, prior_result, mbir_result, qc_report_path)
 
 
@@ -662,6 +667,32 @@ def _load_mbir_lite_result_if_available(folders: RunFolders) -> MBIRLiteResult |
     return MBIRLiteResult(np.asarray(np.load(path), dtype=np.float32), [], False, "loaded")
 
 
+def _load_mbir_lite_initial_volume(
+    folders: RunFolders,
+    config: AppConfig,
+    fdk_volume: np.ndarray | None,
+    prior_result: PriorResult,
+) -> tuple[np.ndarray, str]:
+    start_mode = _normalize_mbir_lite_start_mode(getattr(config.mbir_lite, "start_mode", "fresh_from_fdk"))
+    if start_mode == "resume_previous_final":
+        path = _fast_folder_with_legacy_fallback(folders, "mbir_lite") / "mbir_lite_final.npy"
+        if not path.exists():
+            raise FileNotFoundError(
+                "MBIR-lite start mode 'resume_previous_final' requires an existing "
+                f"{path}. Choose 'fresh_from_fdk' or point Resume run folder to a run that already has MBIR-lite output."
+            )
+        volume = np.asarray(np.load(path), dtype=np.float32)
+        if volume.shape != prior_result.x_prior.shape:
+            raise ValueError(
+                "Existing MBIR-lite final volume shape "
+                f"{volume.shape} does not match the current prior shape {prior_result.x_prior.shape}."
+            )
+        return volume, "resume previous MBIR-lite final"
+    if fdk_volume is not None:
+        return fdk_volume, "fresh from FDK"
+    return np.asarray(prior_result.x_prior, dtype=np.float32), "fresh from prior (FDK unavailable)"
+
+
 def _load_required_volume(path: Path) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f"Required volume is missing: {path}")
@@ -684,6 +715,13 @@ def _manual_fdk_filter(config: AppConfig) -> str | None:
     if value in {"", "auto", "automatic", "score", "score_total"}:
         return None
     return value
+
+
+def _normalize_mbir_lite_start_mode(value: object) -> str:
+    clean = str(value or "fresh_from_fdk").strip().lower()
+    if clean in {"resume_previous_final", "resume", "warm_start", "mbir_lite_final"}:
+        return "resume_previous_final"
+    return "fresh_from_fdk"
 
 
 def _geometry_from_existing_outputs(config: AppConfig, folders: RunFolders) -> GeometryParams:

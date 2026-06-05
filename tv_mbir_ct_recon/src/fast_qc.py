@@ -175,6 +175,7 @@ def _report_lines(
         f"- Selected FDK filter: {'' if fdk_result is None else fdk_result.best_filter}",
         f"- Selected prior: {'' if prior_result is None else prior_result.chosen_method} {'' if prior_result is None else prior_result.chosen_strength:g}",
         f"- MBIR-lite sweeps: {config.mbir_lite.n_sweeps}",
+        f"- MBIR-lite start mode: {getattr(config.mbir_lite, 'start_mode', 'fresh_from_fdk')}",
         f"- lambda_tv: {config.mbir_lite.lambda_tv:g}",
         f"- rho_prior: {config.mbir_lite.rho_prior:g}",
         f"- Projection batch size: {config.mbir_lite.projection_batch_size}",

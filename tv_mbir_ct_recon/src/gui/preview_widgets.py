@@ -11,6 +11,7 @@ from .style import (
     ACCENT_COLOR,
     GRID_COLOR,
     MUTED_TEXT_COLOR,
+    PANEL_BACKGROUND,
     TEXT_COLOR,
     style_axis,
     style_canvas,
@@ -50,30 +51,42 @@ class VolumePreviewWidget(QWidget):
         axis.axis("off")
         self.canvas.draw_idle()
 
-    def show_image(self, image: np.ndarray | None, title: str = "Image preview") -> None:
+    def show_image(
+        self,
+        image: np.ndarray | None,
+        title: str = "Image preview",
+        preserve_zoom: bool = False,
+    ) -> None:
         if image is None:
             self.show_message("No image")
             return
         array = np.asarray(image, dtype=np.float32)
+        previous_zoom = self._zoom_factor
         self._current_image = array
         self._current_volume = None
         self._current_title = title
         self._current_mode = "image"
         self._levels = self._auto_limits(array)
-        self._zoom_factor = 1.0
+        self._zoom_factor = previous_zoom if preserve_zoom else 1.0
         self._draw_current()
 
-    def show_volume(self, volume: np.ndarray, title: str = "Volume preview") -> None:
+    def show_volume(
+        self,
+        volume: np.ndarray,
+        title: str = "Volume preview",
+        preserve_zoom: bool = False,
+    ) -> None:
         if volume is None:
             self.show_message("No volume")
             return
         vol = np.asarray(volume, dtype=np.float32)
+        previous_zoom = self._zoom_factor
         self._current_volume = vol
         self._current_image = vol[vol.shape[0] // 2]
         self._current_title = title
         self._current_mode = "volume"
         self._levels = self._auto_limits(vol)
-        self._zoom_factor = 1.0
+        self._zoom_factor = previous_zoom if preserve_zoom else 1.0
         self._draw_current()
 
     def set_levels(self, low: float, high: float) -> None:
@@ -788,7 +801,7 @@ def _sample_array_for_limits(array: np.ndarray, max_values: int = 1_000_000) -> 
 class HistogramLevelWidget(QWidget):
     def __init__(self, on_levels_changed: Callable[[float, float], None] | None = None) -> None:
         super().__init__()
-        self.figure = Figure(figsize=(3.2, 1.8), dpi=100)
+        self.figure = Figure(figsize=(3.6, 2.2), dpi=100)
         self.canvas = FigureCanvas(self.figure)
         style_figure(self.figure)
         style_canvas(self.canvas)
@@ -797,8 +810,13 @@ class HistogramLevelWidget(QWidget):
         self.low = 0.0
         self.high = 1.0
         self._drag_target: str | None = None
+        self._axis = None
+        self._level_artists: list[object] = []
+        self._hist_empty = True
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
+        self.canvas.setMinimumHeight(220)
         self.canvas.mpl_connect("button_press_event", self._on_press)
         self.canvas.mpl_connect("button_release_event", self._on_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -806,6 +824,9 @@ class HistogramLevelWidget(QWidget):
 
     def show_empty(self) -> None:
         self.image = None
+        self._axis = None
+        self._level_artists = []
+        self._hist_empty = True
         self.figure.clear()
         style_figure(self.figure)
         axis = self.figure.add_subplot(111)
@@ -824,7 +845,7 @@ class HistogramLevelWidget(QWidget):
         self.low, self.high = float(levels[0]), float(levels[1])
         if self.high <= self.low:
             self.high = self.low + 1.0
-        self._draw()
+        self._rebuild_histogram()
 
     def auto_levels(self) -> tuple[float, float]:
         if self.image is None:
@@ -855,30 +876,35 @@ class HistogramLevelWidget(QWidget):
         self.high = float(high)
         if self.high <= self.low:
             self.high = self.low + 1.0
-        self._draw()
+        self._update_level_artists()
         if emit and self.on_levels_changed is not None:
             self.on_levels_changed(self.low, self.high)
 
-    def _draw(self) -> None:
+    def _rebuild_histogram(self) -> None:
         self.figure.clear()
         style_figure(self.figure)
         axis = self.figure.add_subplot(111)
+        self._axis = axis
+        self._level_artists = []
         style_axis(axis, grid=True)
         if self.image is None:
             axis.text(0.5, 0.5, "No active image", ha="center", va="center", transform=axis.transAxes, color=TEXT_COLOR)
             axis.axis("off")
+            self._hist_empty = True
             self.canvas.draw_idle()
             return
         finite = self.image[np.isfinite(self.image)]
         if finite.size:
-            axis.hist(finite.ravel(), bins=96, color=ACCENT_COLOR, alpha=0.9)
-            axis.axvline(self.low, color="#FF8A80", linewidth=1.5)
-            axis.axvline(self.high, color="#80D6B6", linewidth=1.5)
+            sample = _sample_array_for_limits(finite)
+            axis.hist(sample.ravel(), bins=96, color=ACCENT_COLOR, alpha=0.9)
             axis.set_xlim(*self._hist_xlim(finite))
-            axis.set_title(f"Levels {self.low:.4g} to {self.high:.4g}", fontsize=9, color=TEXT_COLOR)
+            axis.set_title("", fontsize=10, color=TEXT_COLOR)
+            self._hist_empty = False
+            self._update_level_artists()
         else:
             axis.text(0.5, 0.5, "No finite pixels", ha="center", va="center", transform=axis.transAxes, color=TEXT_COLOR)
-        axis.tick_params(labelsize=7)
+            self._hist_empty = True
+        axis.tick_params(labelsize=8)
         self.figure.tight_layout(pad=0.6)
         self.canvas.draw_idle()
 
@@ -892,10 +918,20 @@ class HistogramLevelWidget(QWidget):
         return low - pad, high + pad
 
     def _on_press(self, event) -> None:
-        if self.image is None or event.xdata is None:
+        if self.image is None or event.inaxes is not self._axis or event.xdata is None:
             return
         x = float(event.xdata)
-        self._drag_target = "low" if abs(x - self.low) <= abs(x - self.high) else "high"
+        threshold = self._handle_pick_threshold_px()
+        low_px, high_px = self._handle_positions_px()
+        if abs(float(event.x) - low_px) <= threshold and abs(float(event.x) - high_px) <= threshold:
+            self._drag_target = "low" if abs(x - self.low) <= abs(x - self.high) else "high"
+        elif abs(float(event.x) - low_px) <= threshold:
+            self._drag_target = "low"
+        elif abs(float(event.x) - high_px) <= threshold:
+            self._drag_target = "high"
+        else:
+            midpoint = 0.5 * (self.low + self.high)
+            self._drag_target = "low" if x <= midpoint else "high"
         self._move_level(x)
 
     def _on_motion(self, event) -> None:
@@ -911,3 +947,56 @@ class HistogramLevelWidget(QWidget):
             self.set_levels(value, self.high)
         elif self._drag_target == "high":
             self.set_levels(self.low, value)
+
+    def _update_level_artists(self) -> None:
+        if self._axis is None or self._hist_empty:
+            return
+        for artist in self._level_artists:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._level_artists = []
+        axis = self._axis
+        band_half_width = self._handle_band_half_width()
+        low_color = "#FF8A80"
+        high_color = "#80D6B6"
+        self._level_artists.extend(
+            [
+                axis.axvspan(self.low - band_half_width, self.low + band_half_width, color=low_color, alpha=0.24, zorder=3),
+                axis.axvline(self.low, color=low_color, linewidth=3.0, zorder=4),
+                axis.axvspan(self.high - band_half_width, self.high + band_half_width, color=high_color, alpha=0.24, zorder=3),
+                axis.axvline(self.high, color=high_color, linewidth=3.0, zorder=4),
+            ]
+        )
+        ymin, ymax = axis.get_ylim()
+        marker_y = ymin + 0.93 * (ymax - ymin)
+        self._level_artists.extend(
+            [
+                axis.scatter([self.low], [marker_y], s=90, marker="v", color=low_color, edgecolors=PANEL_BACKGROUND, linewidths=0.8, zorder=5),
+                axis.scatter([self.high], [marker_y], s=90, marker="v", color=high_color, edgecolors=PANEL_BACKGROUND, linewidths=0.8, zorder=5),
+            ]
+        )
+        axis.set_title(f"Levels {self.low:.4g} to {self.high:.4g} | drag the shaded handles", fontsize=10, color=TEXT_COLOR)
+        self.canvas.draw_idle()
+
+    def _handle_band_half_width(self) -> float:
+        axis = self._axis
+        if axis is None:
+            return 0.5
+        left, right = axis.get_xlim()
+        return max(abs(right - left) * 0.012, 1e-6)
+
+    def _handle_positions_px(self) -> tuple[float, float]:
+        axis = self._axis
+        if axis is None:
+            return 0.0, 0.0
+        low_px = float(axis.transData.transform((self.low, 0.0))[0])
+        high_px = float(axis.transData.transform((self.high, 0.0))[0])
+        return low_px, high_px
+
+    def _handle_pick_threshold_px(self) -> float:
+        axis = self._axis
+        if axis is None:
+            return 18.0
+        return max(18.0, float(axis.bbox.width) * 0.03)

@@ -210,6 +210,7 @@ class ConfidenceConfig:
 class MBIRLiteConfig:
     enabled: bool = True
     solver: str = "anchored_streaming_subset_tv"
+    start_mode: str = "fresh_from_fdk"
     n_sweeps: int = 5
     projection_batch_size: int = 32
     ordered_subset_count: int = 8

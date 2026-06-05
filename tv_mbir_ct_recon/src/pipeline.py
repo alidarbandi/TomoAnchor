@@ -110,10 +110,14 @@ def execute_pipeline(
     mbir_progress_callback: Callable[[object], None] | None = None,
     mbir_preview_request_callback: Callable[[], object] | None = None,
 ) -> PipelineResult:
-    log = MemoryLog(callback=logger, verbose=logger is None and config.logging.verbose)
     output = OutputManager(config.input.output_folder or "output")
     folders = output.create_run()
     output.save_config(folders, config)
+    log = MemoryLog(
+        callback=logger,
+        verbose=logger is None and config.logging.verbose,
+        persist_path=folders.root / "log.txt",
+    )
     log.write(f"Created run folder: {folders.root}")
     raise_if_cancelled(cancel_check, "Pipeline cancelled.")
 
@@ -512,7 +516,6 @@ def execute_pipeline(
             "Preprocess-only run completed.",
         )
         output.write_report(folders, report)
-        output.save_log(folders, log.lines)
         return PipelineResult(folders, tuple(tigre_input.shape), None, None, report)
 
     if fdk_init_risky:
@@ -652,7 +655,6 @@ def execute_pipeline(
     status = "Run completed."
     report = _report_lines(config, preprocessing.report_lines, report_geometry_lines, memory_lines, status)
     output.write_report(folders, report)
-    output.save_log(folders, log.lines)
     return PipelineResult(folders, tuple(tigre_input.shape), fdk_volume, mbir_result, report)
 
 

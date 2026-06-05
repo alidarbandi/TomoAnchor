@@ -779,10 +779,11 @@ then MBIR-lite pulls the final volume back toward measured projection consistenc
 
 <h3 id="make-prior-guide">Make Prior: What It Does</h3>
 <p>
-Make Prior is the bridge between the FDK sweep and MBIR-lite. It does not create the final reconstruction.
-It takes the selected full-resolution FDK volume, makes one or more weak denoised candidate volumes, checks which
-candidate still agrees with measured tune-anchor projections, and saves a selected prior plus a confidence map.
-MBIR-lite then uses that prior as a soft guide while still fitting measured projection data.
+Make Prior is a training-free prior-building stage between the FDK sweep and MBIR-lite. It does not create the final
+reconstruction. It starts from the selected full-resolution FDK volume, builds a support mask, robustly normalizes the
+volume, generates one denoised candidate for each configured TV weight, scores those candidates against tune-anchor
+projection agreement and image-preservation checks, then saves one selected prior plus a voxelwise confidence map.
+MBIR-lite uses that saved prior as a soft guide while still fitting measured projection data.
 </p>
 <pre>
 best FDK from fast_recon/fdk_sweep/fdk_best.npy
@@ -803,88 +804,103 @@ select accepted candidate with lowest background noise
 save prior_selected, prior_confidence, prior_difference, prior_metrics.csv
 </pre>
 <p>
+Default behavior is one denoising run per entry in <code>prior.tv_weights</code>. With the default list
+<code>[0.005, 0.01, 0.02, 0.04]</code> and <code>prior.tv_iterations: 50</code>, Make Prior performs
+4 denoising candidate runs, each with 50 TV iterations, then chooses the safest acceptable result. If no candidate
+passes the conservative acceptance checks, the weakest TV candidate is used as a fallback.
+</p>
+<p>
 The prior is intentionally conservative. A good prior removes obvious FDK noise and streak texture but should not erase
 small real features. If the prior image looks cleaner but visibly loses fine structure, remove stronger TV weights or
 lower the later MBIR-lite rho prior.
 </p>
+<div class="note">
+Prior tuning parameters are stored in YAML under the <code>prior</code>, <code>prior_scoring</code>,
+<code>confidence</code>, and sometimes <code>mbir_lite</code> sections. In this project you can edit
+<code>config.mbir.yaml</code> in the project root, or start from the example templates
+<code>tv_mbir_ct_recon/examples/fast_recon_config.yaml</code> and
+<code>tv_mbir_ct_recon/examples/sample_config.yaml</code>. Every run also saves the exact active settings to
+<code>output/run_YYYYMMDD_HHMMSS/config_used.yaml</code>, and Make Prior writes a stage-specific copy to
+<code>output/run_YYYYMMDD_HHMMSS/fast_recon/prior/prior_config_used.yaml</code>.
+</div>
 
 <h3 id="make-prior-parameters">Make Prior Parameters</h3>
 <table>
-<tr><th>Parameter</th><th>What it does</th><th>How to use it</th></tr>
+<tr><th>Parameter</th><th>What it does</th><th>How to adjust it</th></tr>
 <tr>
 <td>Prior TV weights</td>
 <td>List of TV denoising strengths tested as separate prior candidates.</td>
-<td>Default 0.005, 0.01, 0.02, 0.04. Smaller values preserve detail and remove less noise. Larger values smooth more and can erase fine features. It is valid to use only one value, such as 0.005, when you already know it is safe for the sample.</td>
+<td>Default 0.005, 0.01, 0.02, 0.04. Add or keep smaller values when fine detail is at risk. Add larger values only when FDK is visibly noisy or streaky. If strong candidates keep winning but erase features, remove the largest weights first.</td>
 </tr>
 <tr>
 <td>prior.tv_iterations</td>
 <td>Number of iterations used by the TV denoiser for each candidate.</td>
-<td>Default 50. Higher values make each candidate more fully denoised but take longer. If the prior is too strong, reduce TV weights before changing iterations.</td>
+<td>Default 50. Increase only if a chosen TV weight is not converging enough to clean the prior. Reduce if runtime is too long or if the same TV weights look stronger than expected. Usually tune TV weights before tuning iterations.</td>
 </tr>
 <tr>
 <td>prior.tv_epsilon</td>
 <td>Small smoothing constant used in TV gradient calculations.</td>
-<td>Default 1.0e-4. Usually leave unchanged. It prevents numerical instability around tiny gradients.</td>
+<td>Default 1.0e-4. Usually leave unchanged. Change only for solver experimentation or numerical stability issues.</td>
 </tr>
 <tr>
 <td>prior.slab_depth and prior.slab_overlap</td>
 <td>Process large volumes in overlapping z slabs during TV denoising.</td>
-<td>Default slab depth 96 and overlap 12. Lower slab depth can reduce RAM use. Overlap blends slab boundaries; keep some overlap unless memory is very tight.</td>
+<td>Default slab depth 96 and overlap 12. Lower slab depth to reduce RAM use. Increase overlap if you suspect slab boundary artifacts. If memory allows, prefer enough overlap to blend boundaries smoothly.</td>
 </tr>
 <tr>
 <td>prior.normalize_low_percentile and normalize_high_percentile</td>
 <td>Robust intensity percentiles used to normalize the FDK before candidate scoring.</td>
-<td>Defaults 0.5 and 99.5. Usually leave unchanged. This makes TV weights behave more consistently across datasets.</td>
+<td>Defaults 0.5 and 99.5. Usually leave unchanged. Adjust only if outliers or clipping make the normalized prior scale unstable across datasets.</td>
 </tr>
 <tr>
 <td>prior.clip_min and clip_max</td>
 <td>Intensity bounds applied after normalization.</td>
-<td>Defaults -0.1 and 1.2. They limit extreme outliers before denoising and confidence estimation.</td>
+<td>Defaults -0.1 and 1.2. Tighten only if extreme outliers dominate denoising or confidence estimation. Widen only if true sample intensities are being clipped.</td>
 </tr>
 <tr>
 <td>prior.support_gaussian_sigma_voxels and support_dilation_voxels</td>
 <td>Build the object support mask used for background-noise and correction measurements.</td>
-<td>The support mask separates sample from background. Increase dilation if edges are being treated as background; reduce it if too much empty area is included as sample.</td>
+<td>Increase dilation if outer sample edges are being treated as background. Reduce dilation if too much empty area is included as sample. Keep support broad enough to cover the object but not so broad that background dominates scoring.</td>
 </tr>
 <tr>
 <td>prior.noise_highpass_sigma_voxels</td>
 <td>Gaussian scale used to estimate normalized FDK noise by high-pass MAD.</td>
-<td>Default 1.5 voxels. This is a diagnostic noise estimate printed in the log, not the only selection rule.</td>
+<td>Default 1.5 voxels. Usually leave unchanged. Adjust only if the noise diagnostic is clearly measuring structure instead of noise.</td>
 </tr>
 <tr>
 <td>prior_scoring.max_anchor_residual_ratio</td>
 <td>Maximum allowed tune-anchor projection residual relative to baseline FDK.</td>
-<td>Default 1.10. A candidate should not fit tune anchors much worse than FDK. Lower is stricter; higher accepts more smoothing risk.</td>
+<td>Default 1.10. Lower it to be stricter and reject candidates that drift away from measured anchor data. Raise it slightly only if all reasonable candidates are failing and the prior is still too noisy.</td>
 </tr>
 <tr>
 <td>prior_scoring.min_edge_retention</td>
 <td>Minimum allowed edge-gradient retention on the strongest FDK edges.</td>
-<td>Default 0.85. If a candidate smooths edges too much, it fails this check.</td>
+<td>Default 0.85. Raise it to protect fine edges more strongly. Lower it only when anchors support more smoothing and you accept some edge softening.</td>
 </tr>
 <tr>
 <td>prior_scoring.max_correction_fraction</td>
 <td>Maximum allowed total change from FDK inside the support mask.</td>
-<td>Default 0.15. This prevents the prior from changing too much of the volume at once.</td>
+<td>Default 0.15. Lower it to keep the prior closer to FDK. Raise it only when the FDK is poor enough that a larger cleanup is genuinely needed.</td>
 </tr>
 <tr>
 <td>prior_scoring.choose_lowest_background_noise_among_valid</td>
 <td>Chooses the lowest background-noise candidate among candidates that pass all conservative checks.</td>
-<td>Default true. If no candidate passes, the weakest TV weight is used as a fallback and the table marks chosen_by_fallback.</td>
+<td>Default true. Usually leave enabled. It helps choose the cleanest acceptable candidate after the safety checks have already filtered the risky ones.</td>
 </tr>
 <tr>
 <td>confidence.C_min and C_max</td>
 <td>Clamp the confidence map used by MBIR-lite.</td>
-<td>Defaults 0.05 and 1.0. High confidence means MBIR-lite can trust the prior more in that voxel; low confidence weakens the prior pull.</td>
+<td>Defaults 0.05 and 1.0. Raise C_min only if MBIR-lite is ignoring a good prior too much. Lower C_min if you want more freedom to move away from the prior. Reduce C_max if the prior is too dominant in confident regions.</td>
 </tr>
 <tr>
 <td>confidence.tau_gradient_loss and blur_sigma_voxels</td>
 <td>Control how confidence drops near places where the prior removed edges, and how smoothly confidence changes spatially.</td>
-<td>Defaults 0.35 and 1.5. Lower tau_gradient_loss is more suspicious of edge loss. Higher blur smooths the confidence map.</td>
+<td>Defaults 0.35 and 1.5. Lower tau_gradient_loss to be more suspicious of lost edges and reduce prior trust near them. Raise it if confidence is being reduced too aggressively. Increase blur to smooth the confidence map; decrease it if confidence needs to stay more local.</td>
 </tr>
 <tr>
 <td>MBIR-lite rho prior</td>
 <td>Not part of Make Prior itself, but controls how strongly MBIR-lite follows the saved confidence-weighted prior.</td>
-<td>Default 0.05. Lower it if the final reconstruction follows an oversmoothed prior too closely.</td>
+<td>Default 0.05. Lower it if the final reconstruction follows an oversmoothed prior too closely. Raise it only when the prior is trustworthy and the projection data are too sparse or noisy to stabilize the result on their own.</td>
 </tr>
 </table>
 
@@ -1046,6 +1062,11 @@ lower the later MBIR-lite rho prior.
 <td>Number of ordered subsets used by MBIR-lite.</td>
 <td>Default 8. Try 4 for more stable but slower updates; 8 is the default speed/stability balance.</td>
 </tr>
+<tr>
+<td>MBIR-lite start volume</td>
+<td>Chooses whether MBIR-lite starts fresh from the saved best FDK or warm-starts from an existing MBIR-lite final volume in the Resume run folder.</td>
+<td>Use Fresh from FDK when comparing parameters reproducibly. Use Resume previous MBIR-lite final when continuing refinement in the same run. Warm-start requires an existing fast_recon/mbir_lite/mbir_lite_final.npy.</td>
+</tr>
 </table>
 
 <h3 id="mbir-lite-batch-vs-subsets">MBIR-lite Batch Size vs Subsets</h3>
@@ -1118,6 +1139,11 @@ so all 200 projections have been touched once in subset form.
 <td>Default 0.05. Increase if the final result ignores a trustworthy prior; decrease if it follows the prior too strongly.</td>
 </tr>
 <tr>
+<td>MBIR-lite start volume</td>
+<td>Controls whether MBIR-lite starts from the saved best FDK or from an existing MBIR-lite final volume in the selected Resume run folder.</td>
+<td>Fresh from FDK is best for reproducible reruns. Resume previous MBIR-lite final is best for continued refinement after a prior run already looks good.</td>
+</tr>
+<tr>
 <td>Resume run folder</td>
 <td>Existing timestamped run folder for stage-only commands such as Make Prior, Run MBIR-lite, or QC Report.</td>
 <td>Required for stage-only fast runs unless all prerequisites are being created in the same run.</td>
@@ -1155,7 +1181,7 @@ so all 200 projections have been touched once in subset form.
 <tr>
 <td>Run MBIR-lite</td>
 <td>Runs the fast prior-anchored solver using main projections, recon anchors, tune anchors if enabled, and not QC anchors by default.</td>
-<td>Use after Make Prior. Set Resume run folder if running this as a separate stage.</td>
+<td>Use after Make Prior. Set Resume run folder if running this as a separate stage. Choose MBIR-lite start volume first: Fresh from FDK for reproducible reruns, or Resume previous MBIR-lite final to continue refining an existing run.</td>
 </tr>
 <tr>
 <td>QC Report</td>
@@ -1600,9 +1626,47 @@ zoom, and pan controls as the other image tabs.
 <tr>
 <td>QC report</td>
 <td>QC preview panel, residual bar plot, and qc_metrics.csv table.</td>
-<td>Held-out QC anchors are the independent check. A visually nicer image is suspect if held-out residuals become much worse.</td>
+<td>Held-out QC anchors are the independent check. Lower residual is better. A visually nicer image is suspect if held-out residuals become much worse.</td>
 </tr>
 </table>
+
+<h3 id="qc-report-reading">How to Read QC Report</h3>
+<p>
+The QC report compares three volumes on anchor projections: the selected FDK, the selected Prior, and the final MBIR-lite
+result. The table and bar graph report normalized projection residuals, so lower values are better.
+</p>
+<table>
+<tr><th>What to compare</th><th>What it means</th><th>How to interpret it</th></tr>
+<tr>
+<td>Final vs FDK on tune anchors</td>
+<td>Shows whether MBIR-lite improved projection consistency on the anchor views used for tuning.</td>
+<td>If Final is clearly lower than FDK, the fast workflow is improving data fit rather than just changing appearance.</td>
+</tr>
+<tr>
+<td>Final vs FDK on QC anchors</td>
+<td>Shows whether the improvement also holds on independent held-out anchor views.</td>
+<td>This is the most important comparison. If Final improves on tune anchors but becomes much worse on QC anchors, treat the run as suspicious or over-tuned.</td>
+</tr>
+<tr>
+<td>Prior vs FDK</td>
+<td>Shows how much the conservative prior alone helped before MBIR-lite refinement.</td>
+<td>A small improvement is normal. The prior is meant to be cautious, not the final answer.</td>
+</tr>
+<tr>
+<td>QC bar annotation</td>
+<td>Percent change of the QC residual relative to the matching tune residual for the same volume.</td>
+<td>Values near 0 percent mean held-out QC behaves similarly to tune. Positive values mean QC residual is lower than tune. Negative values mean QC is worse than tune.</td>
+</tr>
+<tr>
+<td>Preview panel difference images</td>
+<td>Prior - FDK, Final - Prior, and Final - FDK show where each stage changed the reconstruction.</td>
+<td>Sparse or structure-following differences are expected. Large broad changes with worse QC residuals can indicate oversmoothing, bias, or geometry problems.</td>
+</tr>
+</table>
+<p>
+The preview panel tiles are auto-scaled individually for readability, so compare patterns and structure more than raw
+brightness between tiles.
+</p>
 
 <h3 id="make-prior-metrics">Make Prior Metrics Graph and Table</h3>
 <p>
@@ -1781,7 +1845,7 @@ Some config fields are not exposed in the left-side GUI but can be saved, loaded
 <tr><td>prior_scoring.max_anchor_residual_ratio, min_edge_retention, max_correction_fraction</td><td>Conservative acceptance limits for prior candidates.</td><td>Defaults 1.10, 0.85, 0.15. If none pass, the weakest TV prior is used.</td></tr>
 <tr><td>confidence.C_min, C_max, tau_gradient_loss, blur_sigma_voxels</td><td>Controls confidence map range and smoothing.</td><td>Defaults 0.05, 1.0, 0.35, 1.5 voxels.</td></tr>
 <tr><td>mbir_lite.n_sweeps, projection_batch_size, ordered_subset_count</td><td>Fast solver iteration, batching, and subset controls.</td><td>Defaults 5, 32, 8.</td></tr>
-<tr><td>mbir_lite.lambda_tv, rho_prior, tv_epsilon, positivity</td><td>Fast solver regularization and positivity controls.</td><td>Defaults 1.0e-4, 0.05, 1.0e-4, true.</td></tr>
+<tr><td>mbir_lite.start_mode, lambda_tv, rho_prior, tv_epsilon, positivity</td><td>Fast solver initialization, regularization, and positivity controls.</td><td>Defaults fresh_from_fdk, 1.0e-4, 0.05, 1.0e-4, true. Use resume_previous_final only when the run folder already contains mbir_lite_final.npy.</td></tr>
 <tr><td>mbir_lite.use_projection_weights, stop_on_qc_anchor_residual</td><td>Controls statistical weights and QC-aware stopping hooks.</td><td>Projection weights default true. QC residual is reported in metrics when QC anchors exist.</td></tr>
 <tr><td>fast_recon.enabled, output_subfolder, save_intermediate, make_qc_report, resume_run_folder</td><td>Top-level fast workflow behavior and resume path.</td><td>Defaults false, fast_recon, true, true, null. Stage-only commands need resume_run_folder or --fast-run-folder.</td></tr>
 <tr><td>gpu.use_cupy_for_tv_ops</td><td>Allows CuPy TV operations when arrays are CuPy arrays.</td><td>CuPy is optional and not required for the current GUI path.</td></tr>

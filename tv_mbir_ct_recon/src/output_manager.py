@@ -58,7 +58,7 @@ class OutputManager:
         return save_config(config, folders.root / "config_used.yaml")
 
     def save_log(self, folders: RunFolders, lines: list[str]) -> Path:
-        return write_text_lines(folders.root / "log.txt", lines)
+        return write_text_lines(folders.root / "log.txt", lines, append=True)
 
     def save_diagnostics(self, folders: RunFolders, lines: list[str]) -> Path:
         return write_text_lines(folders.root / "diagnostics.txt", lines)

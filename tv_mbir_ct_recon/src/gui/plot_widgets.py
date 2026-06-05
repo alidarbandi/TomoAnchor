@@ -7,11 +7,12 @@ from pathlib import Path
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.image as mpimg
+from matplotlib.transforms import blended_transform_factory
 import numpy as np
 
 from ..admm_tv_mbir import ADMMIterationMetrics
 from ..device_monitor import DeviceMonitorSnapshot, GPULiveSample
-from .qt_compat import QColor, QComboBox, QHBoxLayout, QLabel, QSplitter, QTableWidget, QTableWidgetItem, QTimer, QVBoxLayout, QWidget, Qt
+from .qt_compat import QColor, QComboBox, QHBoxLayout, QLabel, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem, QTimer, QVBoxLayout, QWidget, Qt
 from .style import (
     ACCENT_COLOR,
     GRID_COLOR,
@@ -42,6 +43,10 @@ class MetricsPlotWidget(QWidget):
         self.canvas = FigureCanvas(self.figure)
         style_figure(self.figure)
         style_canvas(self.canvas)
+        self.canvas_scroll = QScrollArea()
+        self.canvas_scroll.setWidget(self.canvas)
+        self.canvas_scroll.setWidgetResizable(False)
+        self.canvas_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         self.category_combo = QComboBox()
         self.category_combo.addItems(["FDK sweep", "Make prior", "MBIR-lite", "QC report"])
         self.detail_label = QLabel("Filter")
@@ -79,12 +84,13 @@ class MetricsPlotWidget(QWidget):
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.addWidget(self.table)
         table_layout.addWidget(self.table_note_label)
-        self.metrics_splitter.addWidget(self.canvas)
+        self.metrics_splitter.addWidget(self.canvas_scroll)
         self.metrics_splitter.addWidget(table_panel)
-        self.metrics_splitter.setStretchFactor(0, 5)
-        self.metrics_splitter.setStretchFactor(1, 2)
-        self.metrics_splitter.setSizes([640, 220])
+        self.metrics_splitter.setStretchFactor(0, 6)
+        self.metrics_splitter.setStretchFactor(1, 1)
+        self.metrics_splitter.setSizes([760, 180])
         layout.addWidget(self.metrics_splitter, 1)
+        self._set_canvas_pixel_size(960, 700)
 
         self.category_combo.currentTextChanged.connect(lambda *_: self._refresh_category(sync_detail=True))
         self.detail_combo.currentTextChanged.connect(lambda *_: self._detail_changed())
@@ -225,9 +231,13 @@ class MetricsPlotWidget(QWidget):
             return
         self._last_layout_category = category
         if category == "Make prior":
-            self.metrics_splitter.setSizes([820, 120])
+            self.metrics_splitter.setSizes([940, 140])
+        elif category == "MBIR-lite":
+            self.metrics_splitter.setSizes([980, 170])
+        elif category == "QC report":
+            self.metrics_splitter.setSizes([960, 160])
         else:
-            self.metrics_splitter.setSizes([640, 220])
+            self.metrics_splitter.setSizes([860, 170])
 
     def _refresh_category(self, sync_detail: bool = False) -> None:
         category = self.category_combo.currentText()
@@ -314,23 +324,36 @@ class MetricsPlotWidget(QWidget):
         folder = self._fast_folder("qc")
         rows = _read_csv_rows(folder / "qc_metrics.csv") if folder is not None else []
         self.status_label.setText(f"QC metric rows: {len(rows)}." if rows else "No QC report metrics are available yet.")
-        self.table_note_label.setText("")
+        self.table_note_label.setText(
+            "Lower residual is better. Compare Final against FDK and Prior on both tune and QC splits. "
+            "QC bar annotations show the percent change of each held-out QC residual relative to the matching tune residual."
+        )
         self._fill_table(rows)
         self._draw_qc_report(folder, rows)
 
     def _draw_fdk_candidate_previews(self, folder: Path | None, selected_filter: str, rows: list[dict[str, str]]) -> None:
         self._start_image_display(f"fdk_sweep:{folder}")
-        self.figure.clear()
-        style_figure(self.figure)
         if folder is None or not rows:
             self._draw_message("Select a filter after FDK sweep scores are available.")
             return
         preview_paths = [_fdk_preview_path(folder, row) for row in rows]
-        cols = min(3, max(1, len(preview_paths)))
-        axes = np.asarray(self.figure.subplots(1, cols)).reshape(-1)
-        for axis, row, path in zip(axes, rows, preview_paths):
+        preview_items = [(row, path, _load_preview_image(path, None)) for row, path in zip(rows, preview_paths)]
+        image_arrays = [image for _row, _path, image in preview_items if image is not None]
+        cols = min(3, max(1, len(preview_items)))
+        row_count = max(1, int(np.ceil(len(preview_items) / cols)))
+        self._size_canvas_for_image_grid(
+            image_arrays,
+            cols=cols,
+            rows=row_count,
+            extra_height=60 + 28 * row_count,
+            minimum_width=940,
+            fallback_width=1320,
+        )
+        self.figure.clear()
+        style_figure(self.figure)
+        axes = np.asarray(self.figure.subplots(row_count, cols)).reshape(-1)
+        for axis, (row, path, image) in zip(axes, preview_items):
             style_axis(axis)
-            image = _load_preview_image(path, None)
             if image is not None:
                 score = _to_float(row.get("score_total"))
                 suffix = f" | score {score:.4g}" if np.isfinite(score) else ""
@@ -338,29 +361,33 @@ class MetricsPlotWidget(QWidget):
             else:
                 axis.text(0.5, 0.5, f"Preview not found\n{path.name}", ha="center", va="center", transform=axis.transAxes, color=TEXT_COLOR)
                 axis.axis("off")
-        for axis in axes[len(rows) :]:
+        for axis in axes[len(preview_items) :]:
             axis.axis("off")
-        self.figure.tight_layout()
+        self.figure.subplots_adjust(left=0.035, right=0.99, top=0.955, bottom=0.06, wspace=0.06, hspace=0.12)
         self._finish_image_display()
         self.canvas.draw_idle()
 
     def _draw_prior_panel(self, folder: Path, selected: str, rows: list[dict[str, str]]) -> None:
         self._start_image_display(f"prior:{selected}")
         image_path, npy_path = _prior_display_paths(folder, selected)
+        preview_image = _load_preview_image(image_path, npy_path)
+        if preview_image is not None:
+            self._size_canvas_for_image(preview_image, extra_height=260, minimum_width=960, fallback_width=1280)
+        else:
+            self._size_canvas_for_plot_grid(minimum_width=960, fallback_width=1180, height_ratio=0.72)
         self.figure.clear()
         style_figure(self.figure)
-        grid = self.figure.add_gridspec(2, 1, height_ratios=[4.2, 1.15], hspace=0.28)
+        grid = self.figure.add_gridspec(2, 1, height_ratios=[4.85, 1.35], hspace=0.18)
         image_axis = self.figure.add_subplot(grid[0, 0])
         plot_axis = self.figure.add_subplot(grid[1, 0])
         style_axis(image_axis)
-        image = _load_preview_image(image_path, npy_path)
-        if image is None:
+        if preview_image is None:
             image_axis.text(0.5, 0.5, f"{selected} is not available yet.", ha="center", va="center", transform=image_axis.transAxes, color=TEXT_COLOR)
             image_axis.axis("off")
         else:
-            self._register_image(image_axis, image, selected)
+            self._register_image(image_axis, preview_image, selected)
         self._plot_prior_metrics(plot_axis, rows)
-        self.figure.subplots_adjust(left=0.05, right=0.98, top=0.94, bottom=0.08, hspace=0.34)
+        self.figure.subplots_adjust(left=0.055, right=0.985, top=0.965, bottom=0.07, hspace=0.23)
         self._finish_image_display()
         self.canvas.draw_idle()
 
@@ -393,6 +420,7 @@ class MetricsPlotWidget(QWidget):
         if not rows:
             self._draw_message("Waiting for MBIR-lite live metrics.")
             return
+        self._size_canvas_for_plot_grid(minimum_width=1080, fallback_width=1400, height_ratio=0.86)
         panels = [
             ("objective_total", "Objective", ACCENT_COLOR, True),
             ("data_weighted", "Data weighted", "#80D6B6", True),
@@ -402,9 +430,19 @@ class MetricsPlotWidget(QWidget):
             ("relative_change", "Relative change", "#DDE8F7", True),
             ("elapsed_s", "Elapsed seconds", "#B39DDB", False),
         ]
-        axes = np.asarray(self.figure.subplots(2, 4)).reshape(-1)
         iterations = np.asarray([_to_float(row.get("iteration"), index + 1) for index, row in enumerate(rows)], dtype=np.float64)
-        for axis, (key, title, color, log_y) in zip(axes, panels):
+        grid = self.figure.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 0.92], hspace=0.32, wspace=0.26)
+        panel_specs = [
+            grid[0, 0],
+            grid[0, 1],
+            grid[0, 2],
+            grid[1, 0],
+            grid[1, 1],
+            grid[1, 2],
+            grid[2, :],
+        ]
+        for spec, (key, title, color, log_y) in zip(panel_specs, panels):
+            axis = self.figure.add_subplot(spec)
             style_axis(axis, grid=True)
             values = np.asarray([_to_float(row.get(key)) for row in rows], dtype=np.float64)
             finite = np.isfinite(iterations) & np.isfinite(values)
@@ -413,24 +451,27 @@ class MetricsPlotWidget(QWidget):
                 axis.plot(iterations[finite], plot_values[finite], linewidth=1.4, marker="o", markersize=3, color=color)
                 if log_y:
                     axis.set_yscale("log")
-            axis.set_title(title, color=TEXT_COLOR, fontsize=9)
-            axis.set_xlabel("Sweep", fontsize=8)
-            axis.tick_params(labelsize=7)
-        for axis in axes[len(panels) :]:
-            axis.axis("off")
-        self.figure.tight_layout(pad=1.0)
+            axis.set_title(title, color=TEXT_COLOR, fontsize=11)
+            axis.set_xlabel("Sweep", fontsize=9)
+            axis.tick_params(labelsize=8)
+        self.figure.subplots_adjust(left=0.06, right=0.985, top=0.955, bottom=0.06)
         self.canvas.draw_idle()
         self._emit_image_changed()
 
     def _draw_qc_report(self, folder: Path | None, rows: list[dict[str, str]]) -> None:
         self._start_image_display("qc")
-        self.figure.clear()
-        style_figure(self.figure)
-        axes = np.asarray(self.figure.subplots(1, 2)).reshape(-1)
-        image_axis, bar_axis = axes[0], axes[1]
-        style_axis(image_axis)
         preview_path = None if folder is None else folder / "preview_panel.png"
         image = _load_preview_image(preview_path, None) if preview_path is not None else None
+        if image is not None:
+            self._size_canvas_for_image(image, extra_height=300, minimum_width=1040, fallback_width=1480)
+        else:
+            self._size_canvas_for_plot_grid(minimum_width=1040, fallback_width=1400, height_ratio=0.88)
+        self.figure.clear()
+        style_figure(self.figure)
+        grid = self.figure.add_gridspec(2, 1, height_ratios=[5.35, 1.95], hspace=0.14)
+        image_axis = self.figure.add_subplot(grid[0, 0])
+        bar_axis = self.figure.add_subplot(grid[1, 0])
+        style_axis(image_axis)
         if image is not None:
             self._register_image(image_axis, image, "QC preview panel")
         else:
@@ -438,20 +479,65 @@ class MetricsPlotWidget(QWidget):
             image_axis.axis("off")
         style_axis(bar_axis, grid=True)
         if rows:
-            labels = [f"{row.get('volume', '')}/{row.get('split', '')}" for row in rows]
-            values = np.asarray([_to_float(row.get("residual")) for row in rows], dtype=np.float64)
-            finite = np.isfinite(values)
-            if np.any(finite):
-                indices = np.arange(len(labels))[finite]
-                bar_axis.bar(indices, np.maximum(values[finite], 1e-30), color=ACCENT_COLOR)
+            grouped = _qc_residual_groups(rows)
+            if grouped:
+                volumes = list(grouped.keys())
+                x = np.arange(len(volumes), dtype=np.float64)
+                width = 0.34
+                tune_values = np.asarray([grouped[volume].get("tune", float("nan")) for volume in volumes], dtype=np.float64)
+                qc_values = np.asarray([grouped[volume].get("qc", float("nan")) for volume in volumes], dtype=np.float64)
+                tune_bars = bar_axis.bar(
+                    x - width / 2.0,
+                    np.where(np.isfinite(tune_values), np.maximum(tune_values, 1e-30), np.nan),
+                    width=width,
+                    color="#80D6B6",
+                    label="Tune",
+                )
+                qc_bars = bar_axis.bar(
+                    x + width / 2.0,
+                    np.where(np.isfinite(qc_values), np.maximum(qc_values, 1e-30), np.nan),
+                    width=width,
+                    color="#A8C7F7",
+                    label="QC",
+                )
                 bar_axis.set_yscale("log")
-                bar_axis.set_xticks(indices)
-                bar_axis.set_xticklabels([labels[index] for index in indices], rotation=35, ha="right", fontsize=7)
-                bar_axis.set_title("Anchor residuals", color=TEXT_COLOR, fontsize=9)
+                bar_axis.set_xticks(x)
+                bar_axis.set_xticklabels([_display_volume_name(volume) for volume in volumes], fontsize=11)
+                bar_axis.tick_params(axis="x", colors=MUTED_TEXT_COLOR, labelsize=11, pad=10)
+                bar_axis.tick_params(axis="y", colors=MUTED_TEXT_COLOR, labelsize=11)
+                bar_axis.set_ylabel("Normalized residual (lower is better)", fontsize=11, color=TEXT_COLOR)
+                bar_axis.set_title("Tune vs held-out QC residuals", color=TEXT_COLOR, fontsize=12)
+                _style_legend(bar_axis.legend(loc="upper right", fontsize=10))
+                annotation_levels = np.linspace(0.68, 0.44, len(volumes), dtype=np.float64)
+                annotation_transform = blended_transform_factory(bar_axis.transData, bar_axis.transAxes)
+                for index, (volume, bar) in enumerate(zip(volumes, qc_bars)):
+                    tune_value = tune_values[index]
+                    qc_value = qc_values[index]
+                    if not np.isfinite(tune_value) or not np.isfinite(qc_value) or tune_value == 0.0:
+                        continue
+                    percent_change = 100.0 * (tune_value - qc_value) / tune_value
+                    color = "#80D6B6" if percent_change >= 0.0 else "#FF8A80"
+                    bar_axis.text(
+                        x[index],
+                        float(annotation_levels[index]),
+                        f"{percent_change:+.1f}% vs tune",
+                        ha="center",
+                        va="center",
+                        fontsize=10,
+                        color=color,
+                        transform=annotation_transform,
+                        clip_on=True,
+                        bbox={
+                            "facecolor": PANEL_BACKGROUND,
+                            "edgecolor": color,
+                            "alpha": 0.9,
+                            "boxstyle": "round,pad=0.2",
+                        },
+                    )
         else:
             bar_axis.text(0.5, 0.5, "Waiting for qc_metrics.csv", ha="center", va="center", transform=bar_axis.transAxes, color=TEXT_COLOR)
             bar_axis.axis("off")
-        self.figure.tight_layout()
+        self.figure.subplots_adjust(left=0.065, right=0.985, top=0.965, bottom=0.065, hspace=0.18)
         self._finish_image_display()
         self.canvas.draw_idle()
 
@@ -524,6 +610,64 @@ class MetricsPlotWidget(QWidget):
             half_height = max(0.5, rows / (2.0 * self._zoom_factor))
             axis.set_xlim(center_col - half_width, center_col + half_width)
             axis.set_ylim(center_row + half_height, center_row - half_height)
+
+    def _set_canvas_pixel_size(self, width: int, height: int) -> None:
+        width = max(720, int(width))
+        height = max(520, int(height))
+        dpi = float(self.figure.dpi or 100.0)
+        self.figure.set_size_inches(width / dpi, height / dpi, forward=True)
+        self.canvas.setMinimumSize(width, height)
+        self.canvas.resize(width, height)
+        self.canvas.updateGeometry()
+
+    def _canvas_target_width(self, minimum_width: int = 920, fallback_width: int = 1280) -> int:
+        viewport_width = 0
+        try:
+            viewport_width = int(self.canvas_scroll.viewport().width())
+        except Exception:
+            viewport_width = 0
+        if viewport_width >= 240:
+            return max(minimum_width, viewport_width - 24)
+        widget_width = int(self.width()) if self.width() > 0 else 0
+        if widget_width >= 320:
+            return max(minimum_width, widget_width - 32)
+        return max(minimum_width, int(fallback_width))
+
+    def _size_canvas_for_image(self, image: np.ndarray, *, extra_height: int, minimum_width: int, fallback_width: int) -> None:
+        array = _as_display_image(image)
+        if array is None:
+            self._size_canvas_for_plot_grid(minimum_width=minimum_width, fallback_width=fallback_width, height_ratio=0.72)
+            return
+        width = self._canvas_target_width(minimum_width=minimum_width, fallback_width=fallback_width)
+        aspect = float(array.shape[0]) / max(float(array.shape[1]), 1.0)
+        height = int(np.clip(width * aspect + float(extra_height), 560.0, 1800.0))
+        self._set_canvas_pixel_size(width, height)
+
+    def _size_canvas_for_image_grid(
+        self,
+        images: list[np.ndarray],
+        *,
+        cols: int,
+        rows: int,
+        extra_height: int,
+        minimum_width: int,
+        fallback_width: int,
+    ) -> None:
+        displays = [array for array in (_as_display_image(image) for image in images) if array is not None]
+        if not displays:
+            self._size_canvas_for_plot_grid(minimum_width=minimum_width, fallback_width=fallback_width, height_ratio=0.62)
+            return
+        mean_height = float(np.mean([array.shape[0] for array in displays]))
+        mean_width = float(np.mean([array.shape[1] for array in displays]))
+        width = self._canvas_target_width(minimum_width=minimum_width, fallback_width=fallback_width)
+        content_aspect = (max(1, rows) * mean_height) / max(float(max(1, cols)) * mean_width, 1.0)
+        height = int(np.clip(width * content_aspect + float(extra_height), 520.0, 1700.0))
+        self._set_canvas_pixel_size(width, height)
+
+    def _size_canvas_for_plot_grid(self, *, minimum_width: int, fallback_width: int, height_ratio: float) -> None:
+        width = self._canvas_target_width(minimum_width=minimum_width, fallback_width=fallback_width)
+        height = int(np.clip(width * float(height_ratio), 560.0, 1600.0))
+        self._set_canvas_pixel_size(width, height)
 
     def _clamped_pan_center(self, shape: tuple[int, ...]) -> tuple[float, float]:
         rows, cols = int(shape[0]), int(shape[1])
@@ -731,6 +875,36 @@ def _prior_selected_row(rows: list[dict[str, object]]) -> int | None:
     if fallback:
         return fallback[0]
     return 0 if rows else None
+
+
+def _qc_residual_groups(rows: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, dict[str, float]] = {}
+    for row in rows:
+        volume = str(row.get("volume", "")).strip().lower()
+        split = str(row.get("split", "")).strip().lower()
+        value = _to_float(row.get("residual"))
+        if not volume or split not in {"tune", "qc"}:
+            continue
+        entry = grouped.setdefault(volume, {})
+        if np.isfinite(value):
+            entry[split] = float(value)
+    ordered: dict[str, dict[str, float]] = {}
+    for volume in ("fdk", "prior", "final"):
+        if volume in grouped:
+            ordered[volume] = grouped[volume]
+    for volume, entry in grouped.items():
+        if volume not in ordered:
+            ordered[volume] = entry
+    return ordered
+
+
+def _display_volume_name(volume: str) -> str:
+    name = str(volume).strip().lower()
+    return {
+        "fdk": "FDK",
+        "prior": "Prior",
+        "final": "Final",
+    }.get(name, name.title())
 
 
 def _fdk_preview_path(folder: Path, row: dict[str, object]) -> Path:

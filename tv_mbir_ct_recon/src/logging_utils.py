@@ -10,14 +10,22 @@ def timestamp() -> str:
 
 
 class MemoryLog:
-    def __init__(self, callback: Callable[[str], None] | None = None, verbose: bool = True) -> None:
+    def __init__(
+        self,
+        callback: Callable[[str], None] | None = None,
+        verbose: bool = True,
+        persist_path: str | Path | None = None,
+    ) -> None:
         self.lines: list[str] = []
         self.callback = callback
         self.verbose = verbose
+        self.persist_path = None if persist_path is None else Path(persist_path)
 
     def write(self, message: str) -> None:
         line = message if message.startswith("[") else f"[{timestamp()}] {message}"
         self.lines.append(line)
+        if self.persist_path is not None:
+            write_text_lines(self.persist_path, [line], append=True)
         if self.callback is not None:
             self.callback(line)
         elif self.verbose:
@@ -28,14 +36,18 @@ class MemoryLog:
             self.write(message)
 
     def save(self, path: str | Path) -> Path:
-        output = Path(path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("\n".join(self.lines) + "\n", encoding="utf-8")
-        return output
+        return write_text_lines(path, self.lines, append=False)
 
 
-def write_text_lines(path: str | Path, lines: Iterable[str]) -> Path:
+def append_text_line(path: str | Path, line: str) -> Path:
+    return write_text_lines(path, [line], append=True)
+
+
+def write_text_lines(path: str | Path, lines: Iterable[str], append: bool = False) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(str(line) for line in lines) + "\n"
+    mode = "a" if append else "w"
+    with output.open(mode, encoding="utf-8") as handle:
+        handle.write(text)
     return output

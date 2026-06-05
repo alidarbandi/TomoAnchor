@@ -232,6 +232,7 @@ confidence:
 mbir_lite:
   enabled: true
   solver: "anchored_streaming_subset_tv"
+  start_mode: "fresh_from_fdk"
   n_sweeps: 5
   projection_batch_size: 32
   ordered_subset_count: 8
