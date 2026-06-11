@@ -234,6 +234,8 @@ class TomogramViewWidget(QWidget):
         self._zoom_factor = 1.0
         self._slice_indices = {"Axial": 0, "Coronal": 0, "Sagittal": 0}
         self._cached_images: dict[str, np.ndarray] = {}
+        self._axis = None
+        self._image_artist = None
         self._block_controls = False
         self._block_tomogram_selection = False
 
@@ -279,6 +281,8 @@ class TomogramViewWidget(QWidget):
         self._cached_images = {}
         self._levels = None
         self._zoom_factor = 1.0
+        self._axis = None
+        self._image_artist = None
         self.slice_label.setText(text)
         self._set_slice_controls(0, 0)
         self.figure.clear()
@@ -334,7 +338,11 @@ class TomogramViewWidget(QWidget):
         if self._volume is None:
             return None
         view = self.current_view()
-        return self._cached_images.get(view, self._image_for_view(view))
+        image = self._cached_images.get(view)
+        if image is None:
+            image = self._image_for_view(view)
+            self._cached_images[view] = image
+        return image
 
     def current_levels(self) -> tuple[float, float] | None:
         return self._levels
@@ -401,7 +409,7 @@ class TomogramViewWidget(QWidget):
         maximum = self._max_slice_for_view(view)
         value = min(max(int(value), 0), maximum)
         self._slice_indices[view] = value
-        self._refresh_cached_images()
+        self._refresh_cached_images(view)
         self._block_controls = True
         self.slice_spin.setValue(value)
         self.slice_slider.setValue(value)
@@ -431,15 +439,22 @@ class TomogramViewWidget(QWidget):
         view = self.current_view()
         index = self._slice_indices[view]
         low, high = self._levels or self._auto_limits(self._volume if self._volume is not None else image)
-        self.figure.clear()
-        style_figure(self.figure)
-        axis = self.figure.add_subplot(111)
-        style_axis(axis)
-        axis.imshow(image, cmap="gray", vmin=low, vmax=high, origin="upper")
-        _apply_image_zoom(axis, image, self._zoom_factor)
+        axis = self._axis
+        if axis is None or self._image_artist is None or len(self.figure.axes) != 1:
+            self.figure.clear()
+            style_figure(self.figure)
+            axis = self.figure.add_subplot(111)
+            style_axis(axis)
+            self._axis = axis
+            self._image_artist = axis.imshow(image, cmap="gray", vmin=low, vmax=high, origin="upper")
+            axis.axis("off")
+            self.figure.tight_layout()
+        else:
+            self._image_artist.set_data(image)
+            self._image_artist.set_clim(low, high)
         axis.set_title(f"{self._title} | {view} slice {index}", color=TEXT_COLOR)
         axis.axis("off")
-        self.figure.tight_layout()
+        _apply_image_zoom(axis, image, self._zoom_factor)
         self.slice_label.setText(
             f"{view} slice {index + 1}/{self._max_slice_for_view(view) + 1}    "
             f"Volume shape z/y/x: {self._volume.shape if self._volume is not None else 'unavailable'}"
@@ -452,11 +467,14 @@ class TomogramViewWidget(QWidget):
         if self.on_image_changed is not None:
             self.on_image_changed()
 
-    def _refresh_cached_images(self) -> None:
+    def _refresh_cached_images(self, view: str | None = None) -> None:
         if self._volume is None:
             self._cached_images = {}
             return
-        self._cached_images = {view: self._image_for_view(view) for view in self.VIEW_LABELS}
+        if view is None:
+            self._cached_images = {label: self._image_for_view(label) for label in self.VIEW_LABELS}
+            return
+        self._cached_images[str(view)] = self._image_for_view(str(view))
 
     def _image_for_view(self, view: str) -> np.ndarray:
         if self._volume is None:
@@ -539,6 +557,8 @@ class RequestedSlicePreviewWidget(QWidget):
         self._displayed_view = "Axial"
         self._displayed_slice_index = 0
         self._pending_request = False
+        self._axis = None
+        self._image_artist = None
         self._block_controls = False
 
         self.view_combo.currentTextChanged.connect(self._view_changed)
@@ -549,6 +569,8 @@ class RequestedSlicePreviewWidget(QWidget):
         self._current_image = None
         self._levels = None
         self._zoom_factor = 1.0
+        self._axis = None
+        self._image_artist = None
         self.figure.clear()
         style_figure(self.figure)
         axis = self.figure.add_subplot(111)
@@ -699,18 +721,25 @@ class RequestedSlicePreviewWidget(QWidget):
             self.show_message("Waiting for first MBIR preview snapshot")
             return
         low, high = self._levels or self._auto_limits(self._current_image)
-        self.figure.clear()
-        style_figure(self.figure)
-        axis = self.figure.add_subplot(111)
-        style_axis(axis)
-        axis.imshow(self._current_image, cmap="gray", vmin=low, vmax=high, origin="upper")
+        axis = self._axis
+        if axis is None or self._image_artist is None or len(self.figure.axes) != 1:
+            self.figure.clear()
+            style_figure(self.figure)
+            axis = self.figure.add_subplot(111)
+            style_axis(axis)
+            self._axis = axis
+            self._image_artist = axis.imshow(self._current_image, cmap="gray", vmin=low, vmax=high, origin="upper")
+            axis.axis("off")
+            self.figure.tight_layout()
+        else:
+            self._image_artist.set_data(self._current_image)
+            self._image_artist.set_clim(low, high)
         _apply_image_zoom(axis, self._current_image, self._zoom_factor)
         axis.set_title(
             f"{self._title} | {self._displayed_view} slice {self._displayed_slice_index + 1}",
             color=TEXT_COLOR,
         )
         axis.axis("off")
-        self.figure.tight_layout()
         self._update_status_label()
         self.canvas.draw_idle()
         if emit:
@@ -773,16 +802,31 @@ class RequestedSlicePreviewWidget(QWidget):
 
 
 def _apply_image_zoom(axis, image: np.ndarray, zoom_factor: float) -> None:
+    rows, cols = np.asarray(image).shape[:2]
     zoom = max(1.0, float(zoom_factor))
     if zoom <= 1.0001:
+        axis.set_xlim(-0.5, cols - 0.5)
+        axis.set_ylim(rows - 0.5, -0.5)
         return
-    rows, cols = np.asarray(image).shape[:2]
     center_col = (cols - 1) / 2.0
     center_row = (rows - 1) / 2.0
     half_width = max(0.5, cols / (2.0 * zoom))
     half_height = max(0.5, rows / (2.0 * zoom))
     axis.set_xlim(center_col - half_width, center_col + half_width)
     axis.set_ylim(center_row + half_height, center_row - half_height)
+
+
+def _array_identity_signature(array: np.ndarray | None) -> tuple[object, ...] | None:
+    if array is None:
+        return None
+    arr = np.asarray(array)
+    data = arr.__array_interface__.get("data", (0, False))
+    return (
+        int(data[0]),
+        tuple(int(dim) for dim in arr.shape),
+        tuple(int(stride) for stride in (arr.strides or ())),
+        str(arr.dtype),
+    )
 
 
 def _sample_array_for_limits(array: np.ndarray, max_values: int = 1_000_000) -> np.ndarray:
@@ -813,6 +857,11 @@ class HistogramLevelWidget(QWidget):
         self._axis = None
         self._level_artists: list[object] = []
         self._hist_empty = True
+        self._log_scale = False
+        self._image_signature: tuple[object, ...] | None = None
+        self._hist_counts_linear: np.ndarray | None = None
+        self._hist_edges: np.ndarray | None = None
+        self._hist_xlim_values: tuple[float, float] | None = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.canvas)
@@ -827,6 +876,10 @@ class HistogramLevelWidget(QWidget):
         self._axis = None
         self._level_artists = []
         self._hist_empty = True
+        self._image_signature = None
+        self._hist_counts_linear = None
+        self._hist_edges = None
+        self._hist_xlim_values = None
         self.figure.clear()
         style_figure(self.figure)
         axis = self.figure.add_subplot(111)
@@ -839,12 +892,19 @@ class HistogramLevelWidget(QWidget):
         if image is None:
             self.show_empty()
             return
-        self.image = np.asarray(image, dtype=np.float32)
+        array = np.asarray(image, dtype=np.float32)
+        signature = _array_identity_signature(array)
+        same_image = signature == self._image_signature
+        self.image = array
         if levels is None:
             levels = self.auto_levels()
         self.low, self.high = float(levels[0]), float(levels[1])
         if self.high <= self.low:
             self.high = self.low + 1.0
+        if same_image and self._axis is not None and self._hist_counts_linear is not None:
+            self._update_level_artists()
+            return
+        self._image_signature = signature
         self._rebuild_histogram()
 
     def auto_levels(self) -> tuple[float, float]:
@@ -871,6 +931,17 @@ class HistogramLevelWidget(QWidget):
             high = low + 1.0
         return low, high
 
+    def log_scale_enabled(self) -> bool:
+        return bool(self._log_scale)
+
+    def set_log_scale(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._log_scale:
+            return
+        self._log_scale = enabled
+        if self.image is not None:
+            self._draw_histogram_from_cache()
+
     def set_levels(self, low: float, high: float, emit: bool = True) -> None:
         self.low = float(low)
         self.high = float(high)
@@ -881,6 +952,23 @@ class HistogramLevelWidget(QWidget):
             self.on_levels_changed(self.low, self.high)
 
     def _rebuild_histogram(self) -> None:
+        if self.image is None:
+            self.show_empty()
+            return
+        finite = self.image[np.isfinite(self.image)]
+        if finite.size:
+            sample = _sample_array_for_limits(finite)
+            counts, edges = np.histogram(sample.ravel(), bins=96)
+            self._hist_counts_linear = np.asarray(counts, dtype=np.float64)
+            self._hist_edges = np.asarray(edges, dtype=np.float64)
+            self._hist_xlim_values = self._hist_xlim(finite)
+        else:
+            self._hist_counts_linear = None
+            self._hist_edges = None
+            self._hist_xlim_values = None
+        self._draw_histogram_from_cache()
+
+    def _draw_histogram_from_cache(self) -> None:
         self.figure.clear()
         style_figure(self.figure)
         axis = self.figure.add_subplot(111)
@@ -893,17 +981,26 @@ class HistogramLevelWidget(QWidget):
             self._hist_empty = True
             self.canvas.draw_idle()
             return
-        finite = self.image[np.isfinite(self.image)]
-        if finite.size:
-            sample = _sample_array_for_limits(finite)
-            axis.hist(sample.ravel(), bins=96, color=ACCENT_COLOR, alpha=0.9)
-            axis.set_xlim(*self._hist_xlim(finite))
-            axis.set_title("", fontsize=10, color=TEXT_COLOR)
-            self._hist_empty = False
-            self._update_level_artists()
-        else:
+        if self._hist_counts_linear is None or self._hist_edges is None or self._hist_xlim_values is None:
             axis.text(0.5, 0.5, "No finite pixels", ha="center", va="center", transform=axis.transAxes, color=TEXT_COLOR)
+            axis.axis("off")
             self._hist_empty = True
+            self.canvas.draw_idle()
+            return
+        counts = np.asarray(self._hist_counts_linear, dtype=np.float64)
+        if self._log_scale:
+            positive = counts > 0.0
+            floor = max(float(np.min(counts[positive])) * 0.5, 1e-3) if np.any(positive) else 1e-3
+            counts = np.where(positive, counts, floor)
+        axis.stairs(counts, self._hist_edges, fill=True, color=ACCENT_COLOR, alpha=0.9, linewidth=1.0)
+        if self._log_scale:
+            axis.set_yscale("log")
+        axis.set_xlim(*self._hist_xlim_values)
+        axis.set_xlabel("Intensity", fontsize=8)
+        axis.set_ylabel("Count (log)" if self._log_scale else "Count", fontsize=8)
+        axis.set_title("", fontsize=10, color=TEXT_COLOR)
+        self._hist_empty = False
+        self._update_level_artists()
         axis.tick_params(labelsize=8)
         self.figure.tight_layout(pad=0.6)
         self.canvas.draw_idle()
@@ -977,7 +1074,8 @@ class HistogramLevelWidget(QWidget):
                 axis.scatter([self.high], [marker_y], s=90, marker="v", color=high_color, edgecolors=PANEL_BACKGROUND, linewidths=0.8, zorder=5),
             ]
         )
-        axis.set_title(f"Levels {self.low:.4g} to {self.high:.4g} | drag the shaded handles", fontsize=10, color=TEXT_COLOR)
+        mode_label = "log" if self._log_scale else "linear"
+        axis.set_title(f"Levels {self.low:.4g} to {self.high:.4g} | {mode_label} histogram", fontsize=10, color=TEXT_COLOR)
         self.canvas.draw_idle()
 
     def _handle_band_half_width(self) -> float:

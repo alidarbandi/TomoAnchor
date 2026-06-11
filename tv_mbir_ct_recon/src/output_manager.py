@@ -63,10 +63,14 @@ class OutputManager:
     def save_diagnostics(self, folders: RunFolders, lines: list[str]) -> Path:
         return write_text_lines(folders.root / "diagnostics.txt", lines)
 
-    def save_volume_outputs(self, folder: Path, stem: str, volume: np.ndarray) -> tuple[Path, Path]:
+    def save_volume_outputs(self, folder: Path, stem: str, volume: np.ndarray, save_tif: bool = True) -> tuple[Path, Path | None]:
         npy = folder / f"{stem}.npy"
-        np.save(npy, np.asarray(volume, dtype=np.float32))
-        tif = save_stack_tiff(folder / f"{stem}.tif", volume)
+        npy.parent.mkdir(parents=True, exist_ok=True)
+        temp_npy = npy.parent / f".{npy.name}.{datetime.now().strftime('%Y%m%d%H%M%S%f')}.tmp"
+        with temp_npy.open("wb") as handle:
+            np.save(handle, np.asarray(volume, dtype=np.float32))
+        temp_npy.replace(npy)
+        tif = save_stack_tiff(folder / f"{stem}.tif", volume) if save_tif else None
         return npy, tif
 
     def write_report(self, folders: RunFolders, lines: list[str]) -> Path:

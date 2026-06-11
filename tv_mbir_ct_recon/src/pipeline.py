@@ -586,21 +586,57 @@ def execute_pipeline(
                 f"mode={operator.memory_mode}, batch_size={operator.projection_batch_size}, "
                 f"ordered_subsets={operator.ordered_subset_count}"
             )
+            checkpoint_metrics: list[object] = []
+            checkpoint_period = max(1, int(config.mbir.save_every))
+
+            def save_mbir_checkpoint(volume: np.ndarray, iteration: int) -> None:
+                output.save_volume_outputs(folders.mbir, "mbir_final_volume", volume, save_tif=False)
+                save_volume_preview(folders.mbir / "mbir_preview.png", volume, "TomoAnchor MBIR checkpoint")
+                if fdk_volume is not None:
+                    save_volume_preview(
+                        folders.mbir / "mbir_minus_fdk_preview.png",
+                        volume - fdk_volume,
+                        "MBIR minus FDK",
+                    )
+                write_metrics_csv(folders.metrics / "metrics.csv", checkpoint_metrics)
+                save_metrics_plots(folders.metrics, checkpoint_metrics)
+                checkpoint_report = _report_lines(
+                    config,
+                    preprocessing.report_lines,
+                    report_geometry_lines,
+                    memory_lines,
+                    (
+                        f"MBIR checkpoint saved after iteration {iteration}/{int(config.mbir.max_admm_iterations)}. "
+                        "Run still in progress."
+                    ),
+                )
+                output.write_report(folders, checkpoint_report)
 
             def solver_progress(progress_event, volume=None) -> None:
-                if mbir_progress_callback is None:
-                    return
                 if isinstance(progress_event, dict) and progress_event.get("kind") == "cg_progress":
-                    payload = dict(progress_event)
-                    payload.setdefault("solver", effective_solver)
-                    mbir_progress_callback(payload)
+                    if mbir_progress_callback is not None:
+                        payload = dict(progress_event)
+                        payload.setdefault("solver", effective_solver)
+                        mbir_progress_callback(payload)
                     return
                 metrics = progress_event
+                checkpoint_metrics.append(metrics)
+                if volume is not None and int(metrics.iteration) % checkpoint_period == 0:
+                    try:
+                        save_mbir_checkpoint(np.asarray(volume, dtype=np.float32), int(metrics.iteration))
+                        log.write(
+                            "Saved MBIR checkpoint: "
+                            f"iteration {int(metrics.iteration)} -> {folders.mbir / 'mbir_final_volume.npy'}"
+                        )
+                    except Exception as exc:
+                        log.write(f"Warning: failed to save MBIR checkpoint at iteration {int(metrics.iteration)}: {exc}")
+                if mbir_progress_callback is None:
+                    return
                 preview_image = None
                 preview_view = None
                 preview_slice_index = None
                 preview_slice_counts = None
-                preview_period = max(1, int(config.mbir.save_every))
+                preview_period = checkpoint_period
                 if metrics.iteration == 1 or metrics.iteration % preview_period == 0:
                     preview_request = mbir_preview_request_callback() if callable(mbir_preview_request_callback) else None
                     preview_image, preview_view, preview_slice_index, preview_slice_counts = extract_preview_slice_for_gui(
@@ -629,7 +665,7 @@ def execute_pipeline(
                 operator,
                 config.mbir,
                 logger=log.write,
-                progress_callback=solver_progress if mbir_progress_callback is not None else None,
+                progress_callback=solver_progress,
                 cancel_check=cancel_check,
             )
             mbir_result = solver.reconstruct(tigre_input, x0=x0)

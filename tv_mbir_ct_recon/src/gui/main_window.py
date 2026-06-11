@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import sys
 import threading
 import traceback
 from dataclasses import dataclass
@@ -150,18 +151,108 @@ def _append_tomogram_source(
         sources[str(source_id)] = source
 
 
+def _tomogram_source_signature(source: TomogramSource) -> str:
+    if source.path is not None:
+        try:
+            return f"path:{source.path.resolve()}"
+        except Exception:
+            return f"path:{source.path}"
+    if source.volume is not None:
+        array = np.asarray(source.volume)
+        return f"memory:{id(source.volume)}:{array.shape}:{array.dtype}"
+    return f"label:{source.label}"
+
+
+def _tomogram_source_context(source: TomogramSource) -> str:
+    path = source.path
+    if path is None:
+        return "loaded"
+    try:
+        parents = [path.parent, *list(path.parents)]
+    except Exception:
+        parents = [path.parent]
+    for parent in parents:
+        name = str(parent.name).strip()
+        if name.startswith("run_"):
+            return name
+    for parent in parents:
+        name = str(parent.name).strip()
+        if name:
+            return name
+    return path.stem or "saved"
+
+
+def _tomogram_source_context_label(source: TomogramSource) -> str:
+    context = _tomogram_source_context(source)
+    suffix = f"[{context}]"
+    if str(source.label).endswith(suffix):
+        return str(source.label)
+    return f"{source.label} {suffix}"
+
+
+def _safe_tomogram_source_key(value: str) -> str:
+    clean = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value).strip())
+    while "__" in clean:
+        clean = clean.replace("__", "_")
+    return clean.strip("_") or "saved"
+
+
+def _unique_tomogram_source_id(base_id: str, existing_ids: set[str]) -> str:
+    candidate = str(base_id)
+    index = 2
+    while candidate in existing_ids:
+        candidate = f"{base_id}#{index}"
+        index += 1
+    return candidate
+
+
+def _has_tomogram_source_signature(
+    sources: dict[str, TomogramSource],
+    signature: str,
+    *,
+    exclude_id: str | None = None,
+) -> bool:
+    for source_id, source in sources.items():
+        if exclude_id is not None and str(source_id) == str(exclude_id):
+            continue
+        if _tomogram_source_signature(source) == signature:
+            return True
+    return False
+
+
 def _merge_tomogram_source_maps(*source_maps: dict[str, TomogramSource]) -> dict[str, TomogramSource]:
     merged: dict[str, TomogramSource] = {}
-    for source_id in _TOMOGRAM_SOURCE_DISPLAY_ORDER:
-        for source_map in source_maps:
-            source = source_map.get(source_id)
-            if source is not None and _tomogram_source_is_available(source):
-                merged[source_id] = source
     for source_map in source_maps:
         for source_id, source in source_map.items():
-            if source_id not in merged and _tomogram_source_is_available(source):
-                merged[str(source_id)] = source
-    return merged
+            source_key = str(source_id)
+            if not _tomogram_source_is_available(source):
+                continue
+            existing = merged.get(source_key)
+            if existing is None:
+                merged[source_key] = source
+                continue
+            existing_signature = _tomogram_source_signature(existing)
+            source_signature = _tomogram_source_signature(source)
+            if existing_signature == source_signature:
+                merged[source_key] = source
+                continue
+            if not _has_tomogram_source_signature(merged, existing_signature, exclude_id=source_key):
+                alias_base = f"{source_key}@{_safe_tomogram_source_key(_tomogram_source_context(existing))}"
+                alias_id = _unique_tomogram_source_id(alias_base, set(merged.keys()))
+                merged[alias_id] = TomogramSource(
+                    _tomogram_source_context_label(existing),
+                    path=existing.path,
+                    volume=existing.volume,
+                )
+            merged[source_key] = source
+    ordered: dict[str, TomogramSource] = {}
+    for source_id in _TOMOGRAM_SOURCE_DISPLAY_ORDER:
+        if source_id in merged:
+            ordered[source_id] = merged[source_id]
+    for source_id, source in merged.items():
+        if source_id not in ordered:
+            ordered[source_id] = source
+    return ordered
 
 
 class CheckableComboBox(QComboBox):
@@ -297,8 +388,10 @@ class TVMBIRMainWindow(QMainWindow):
         self.auto_best_shift_px: float | None = None
         self.auto_best_preview_index: int | None = None
         self._live_mbir_metrics: list[Any] = []
+        self._live_mbir_metric_category = "MBIR"
         self._mbir_max_iterations = 0
         self._mbir_preview_started = False
+        self._histogram_log_scale_enabled = False
         self._device_monitor_selected_gpu_ids: tuple[int, ...] = ()
         self._device_monitor_runtime_logging_enabled = False
         self._device_monitor_runtime_log_interval_s = 15.0
@@ -368,9 +461,10 @@ class TVMBIRMainWindow(QMainWindow):
         self.mbir_preview = RequestedSlicePreviewWidget(self._active_image_changed, self._mbir_preview_request_changed)
         self.mbir_preview.show_message("MBIR preview will appear during reconstruction")
         self.tabs.addTab(self.mbir_preview, "MBIR Preview")
-        self.tabs.currentChanged.connect(lambda *_: self._active_image_changed())
+        self.tabs.currentChanged.connect(self._tabs_changed)
         splitter.addWidget(self.tabs)
         splitter.setSizes([520, 900])
+        self._tabs_changed()
 
     def _initialize_device_monitor(self) -> None:
         self._device_monitor_timer = QTimer(self)
@@ -579,8 +673,11 @@ class TVMBIRMainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         self.level_histogram = HistogramLevelWidget(self._preview_levels_changed)
         self.level_histogram.setMinimumHeight(240)
+        self.level_histogram.set_log_scale(self._histogram_log_scale_enabled)
         self.auto_level_button = QPushButton("Auto 1-99%")
         self.full_level_button = QPushButton("Full Range")
+        self.histogram_log_checkbox = QCheckBox("Log histogram")
+        self.histogram_log_checkbox.setChecked(self._histogram_log_scale_enabled)
         self.zoom_in_button = QPushButton("Zoom In")
         self.zoom_out_button = QPushButton("Zoom Out")
         self.fit_view_button = QPushButton("Fit")
@@ -588,6 +685,7 @@ class TVMBIRMainWindow(QMainWindow):
         level_row = QHBoxLayout()
         level_row.addWidget(self.auto_level_button)
         level_row.addWidget(self.full_level_button)
+        level_row.addWidget(self.histogram_log_checkbox)
         zoom_row = QHBoxLayout()
         zoom_row.addWidget(self.zoom_in_button)
         zoom_row.addWidget(self.zoom_out_button)
@@ -598,6 +696,7 @@ class TVMBIRMainWindow(QMainWindow):
         layout.addLayout(zoom_row)
         self.auto_level_button.clicked.connect(self._auto_level_active_preview)
         self.full_level_button.clicked.connect(self._full_range_active_preview)
+        self.histogram_log_checkbox.toggled.connect(self._histogram_log_scale_changed)
         self.zoom_in_button.clicked.connect(lambda: self._zoom_active_image(1.25))
         self.zoom_out_button.clicked.connect(lambda: self._zoom_active_image(1.0 / 1.25))
         self.fit_view_button.clicked.connect(self._fit_active_image)
@@ -1652,17 +1751,15 @@ class TVMBIRMainWindow(QMainWindow):
 
         loaded_parts: list[str] = []
         if loaded_root is not None:
-            self.metrics_plot.show_metrics([])
+            self.metrics_plot.clear_live_mbir_metrics()
             self.metrics_plot.set_run_folder(loaded_root)
             category = self._preferred_metrics_category(loaded_root)
             if category:
                 self.metrics_plot.select_category(category)
-            standard_metrics = self._load_standard_metrics_from_run(loaded_root)
-            if standard_metrics and category is None:
-                self.metrics_plot.select_category("MBIR-lite")
-                self.metrics_plot.show_metrics(standard_metrics)
-            elif standard_metrics and category == "MBIR-lite" and self._fast_child_path(loaded_root, "mbir_lite", "metrics.csv") is None:
-                self.metrics_plot.show_metrics(standard_metrics)
+            else:
+                standard_metrics = self._load_standard_metrics_from_run(loaded_root)
+                if standard_metrics:
+                    self.metrics_plot.select_category("MBIR")
             loaded_parts.append(f"run folder {loaded_root}")
 
         if loaded_sources:
@@ -1794,6 +1891,8 @@ class TVMBIRMainWindow(QMainWindow):
     def _preferred_metrics_category(self, root: Path) -> str | None:
         if self._fast_child_path(root, "mbir_lite", "metrics.csv") is not None:
             return "MBIR-lite"
+        if (self._normalize_preload_run_root(root) / "metrics" / "metrics.csv").exists():
+            return "MBIR"
         if self._fast_child_path(root, "prior", "prior_metrics.csv") is not None:
             return "Make prior"
         if self._fast_child_path(root, "fdk_sweep", "scores.csv") is not None:
@@ -1933,6 +2032,11 @@ class TVMBIRMainWindow(QMainWindow):
             return self.metrics_plot
         return None
 
+    def _tabs_changed(self, *_: object) -> None:
+        if hasattr(self, "metrics_plot") and hasattr(self, "tabs"):
+            self.metrics_plot.set_polling_enabled(self.tabs.currentWidget() is self.metrics_plot)
+        self._active_image_changed()
+
     def _active_image_changed(self) -> None:
         self._sync_level_histogram()
         self._update_zoom_label()
@@ -1971,6 +2075,11 @@ class TVMBIRMainWindow(QMainWindow):
         self.level_histogram.set_levels(levels[0], levels[1], emit=False)
         active.set_levels(levels[0], levels[1])
         self._update_zoom_label()
+
+    def _histogram_log_scale_changed(self, checked: bool) -> None:
+        self._histogram_log_scale_enabled = bool(checked)
+        if hasattr(self, "level_histogram"):
+            self.level_histogram.set_log_scale(self._histogram_log_scale_enabled)
 
     def _zoom_active_image(self, factor: float) -> None:
         active = self._active_image_widget()
@@ -2400,6 +2509,7 @@ class TVMBIRMainWindow(QMainWindow):
                 cfg.mbir.max_admm_iterations,
                 cfg.mbir.solver,
                 tuple(int(value or 0) for value in cfg.geometry.volume_voxels),
+                category="MBIR",
             )
 
         def job(log: Callable[[str], None], mbir_progress: Callable[[object], None] | None = None):
@@ -2448,6 +2558,7 @@ class TVMBIRMainWindow(QMainWindow):
                 cfg.mbir_lite.n_sweeps,
                 cfg.mbir_lite.solver,
                 tuple(int(value or 0) for value in cfg.geometry.volume_voxels),
+                category="MBIR-lite",
             )
 
         def job(log: Callable[[str], None], mbir_progress: Callable[[object], None] | None = None):
@@ -3198,16 +3309,18 @@ class TVMBIRMainWindow(QMainWindow):
         max_iterations: int,
         solver: str = "auto",
         volume_shape_hint: tuple[int, int, int] | None = None,
+        category: str = "MBIR",
     ) -> None:
         self._live_mbir_metrics = []
+        self._live_mbir_metric_category = str(category or "MBIR")
         self._mbir_max_iterations = max(1, int(max_iterations))
         self._mbir_preview_started = False
         self._mbir_preview_volume_source = None
         solver_label = _solver_display_name(solver)
         if volume_shape_hint is not None and min(int(v) for v in volume_shape_hint) > 0:
             self.mbir_preview.set_volume_shape_hint(volume_shape_hint)
-        self.metrics_plot.select_category("MBIR-lite")
-        self.metrics_plot.show_metrics([])
+        self.metrics_plot.select_category(self._live_mbir_metric_category)
+        self.metrics_plot.begin_live_mbir_session(self._live_mbir_metric_category)
         self.progress_bar.setRange(0, self._mbir_max_iterations)
         self.progress_bar.setValue(0)
         self.mbir_iteration_label.setText(f"Waiting for {solver_label} iteration 1/{self._mbir_max_iterations}")
@@ -3230,7 +3343,7 @@ class TVMBIRMainWindow(QMainWindow):
         if metric is None:
             return
         self._live_mbir_metrics.append(metric)
-        self.metrics_plot.show_metrics(self._live_mbir_metrics)
+        self.metrics_plot.show_metrics(self._live_mbir_metrics, category=self._live_mbir_metric_category)
         max_iterations = int(payload.get("max_iterations") or self._mbir_max_iterations or int(metric.iteration))
         self._mbir_max_iterations = max(1, max_iterations)
         self.progress_bar.setRange(0, self._mbir_max_iterations)
@@ -3332,7 +3445,8 @@ class TVMBIRMainWindow(QMainWindow):
         if fast_qc_report is not None:
             self._log(f"Fast QC report: {fast_qc_report}")
         if fast_mbir_result is not None:
-            self.metrics_plot.show_metrics(fast_mbir_result.metrics)
+            self.metrics_plot.select_category("MBIR-lite")
+            self.metrics_plot.show_metrics(fast_mbir_result.metrics, category="MBIR-lite")
             self._show_mbir_requested_slice(fast_mbir_result.volume, "Fast MBIR-lite final")
             self._load_tomogram_source("mbir_lite", switch_to_tab=False, preserve_view_state=False)
             self.tabs.setCurrentWidget(self.mbir_preview)
@@ -3342,7 +3456,8 @@ class TVMBIRMainWindow(QMainWindow):
         elif fast_fdk_result is not None:
             self._load_tomogram_source("fast_fdk", switch_to_tab=True, preserve_view_state=False)
         elif standard_mbir_result is not None:
-            self.metrics_plot.show_metrics(standard_mbir_result.metrics)
+            self.metrics_plot.select_category("MBIR")
+            self.metrics_plot.show_metrics(standard_mbir_result.metrics, category="MBIR")
             self._show_mbir_requested_slice(standard_mbir_result.volume, "TomoAnchor MBIR final")
             self._load_tomogram_source("mbir", switch_to_tab=False, preserve_view_state=False)
             self.tabs.setCurrentWidget(self.mbir_preview)
@@ -3366,6 +3481,7 @@ class TVMBIRMainWindow(QMainWindow):
     def _worker_finished(self) -> None:
         self._thread = None
         self._worker = None
+        self.metrics_plot.end_live_mbir_session(self._live_mbir_metric_category)
         self._set_device_monitor_runtime_logging(False)
         self._set_busy(False)
 
@@ -3558,8 +3674,21 @@ def _solver_detail_text(solver: str, metric: object) -> str:
     return "Solver detail unavailable"
 
 
+def _configure_application_icon(app: QApplication) -> None:
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("alidarbandi.TomoAnchor")
+        except Exception:
+            pass
+
+
 def run_app(argv: list[str] | None = None) -> int:
     app = QApplication(argv or [])
+    _configure_application_icon(app)
     app.setStyleSheet(APP_STYLE_SHEET)
     window = TVMBIRMainWindow()
     window.show()

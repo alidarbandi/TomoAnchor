@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .admm_tv_mbir import ADMMIterationMetrics
-from .io_utils import save_png_image
+from .io_utils import replace_file_atomically, save_png_image, temporary_output_path
 
 
 def save_volume_preview(path: str | Path, volume: np.ndarray, title: str = "Volume preview") -> Path:
@@ -33,9 +33,10 @@ def save_volume_preview(path: str | Path, volume: np.ndarray, title: str = "Volu
         axis.set_title(label)
         axis.axis("off")
     fig.suptitle(title)
-    fig.savefig(output, dpi=150)
+    temp = temporary_output_path(output, suffix=".png.tmp")
+    fig.savefig(temp, dpi=150)
     plt.close(fig)
-    return output
+    return replace_file_atomically(temp, output)
 
 
 def save_metrics_plots(folder: str | Path, metrics: list[ADMMIterationMetrics]) -> list[Path]:
@@ -74,9 +75,10 @@ def _plot_series(path: Path, x: list[int], y: list[float], title: str, logy: boo
     ax.grid(True, alpha=0.3)
     if logy:
         ax.set_yscale("log")
-    fig.savefig(path, dpi=150)
+    temp = temporary_output_path(path, suffix=".png.tmp")
+    fig.savefig(temp, dpi=150)
     plt.close(fig)
-    return path
+    return replace_file_atomically(temp, path)
 
 
 def _plot_multi(path: Path, x: list[int], series: dict[str, list[float]], title: str) -> Path:
@@ -87,6 +89,7 @@ def _plot_multi(path: Path, x: list[int], series: dict[str, list[float]], title:
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend()
-    fig.savefig(path, dpi=150)
+    temp = temporary_output_path(path, suffix=".png.tmp")
+    fig.savefig(temp, dpi=150)
     plt.close(fig)
-    return path
+    return replace_file_atomically(temp, path)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import threading
+import traceback
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -12,7 +15,24 @@ import numpy as np
 
 from ..admm_tv_mbir import ADMMIterationMetrics
 from ..device_monitor import DeviceMonitorSnapshot, GPULiveSample
-from .qt_compat import QColor, QComboBox, QHBoxLayout, QLabel, QScrollArea, QSplitter, QTableWidget, QTableWidgetItem, QTimer, QVBoxLayout, QWidget, Qt
+from .qt_compat import (
+    QColor,
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QObject,
+    QScrollArea,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QThread,
+    QTimer,
+    QVBoxLayout,
+    QWidget,
+    Qt,
+    Signal,
+    Slot,
+)
 from .style import (
     ACCENT_COLOR,
     GRID_COLOR,
@@ -33,6 +53,65 @@ _DEVICE_COLORS = [
     "#DDE8F7",
 ]
 _FAST_RECON_CHILD_FOLDERS = {"anchors", "fdk_sweep", "intermediate", "mbir_lite", "prior", "qc"}
+_FAST_CATEGORY_CHILDREN = {
+    "FDK sweep": ("fdk_sweep", "scores.csv"),
+    "Make prior": ("prior", "prior_metrics.csv"),
+    "MBIR-lite": ("mbir_lite", "metrics.csv"),
+    "QC report": ("qc", "qc_metrics.csv"),
+}
+_CSV_CACHE_LOCK = threading.Lock()
+_CSV_CACHE: dict[str, tuple[object, list[dict[str, str]]]] = {}
+_TEXT_CACHE_LOCK = threading.Lock()
+_TEXT_CACHE: dict[str, tuple[object, dict[str, str]]] = {}
+_PREVIEW_CACHE_LOCK = threading.Lock()
+_PREVIEW_CACHE: dict[tuple[str | None, str | None], tuple[object, np.ndarray | None]] = {}
+
+
+@dataclass(frozen=True)
+class _MetricsRefreshRequest:
+    request_id: int
+    category: str
+    sync_detail: bool
+    current_detail: str
+    category_run_roots: dict[str, Path]
+    live_mbir_rows: list[dict[str, object]]
+    live_mbir_lite_rows: list[dict[str, object]]
+    waiting_for_live_mbir_metrics: bool
+    waiting_for_live_mbir_lite_metrics: bool
+
+
+@dataclass(frozen=True)
+class _MetricsRefreshResult:
+    request_id: int
+    category: str
+    detail_choices: list[str]
+    detail_label: str
+    selected_detail: str
+    status_text: str
+    table_note_text: str
+    rows: list[dict[str, object]]
+    highlight_index: int | None
+    render_kind: str
+    render_payload: dict[str, object]
+    render_key: tuple[object, ...]
+
+
+class _MetricsRefreshWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(int, str)
+
+    def __init__(self, request: _MetricsRefreshRequest) -> None:
+        super().__init__()
+        self.request = request
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = _load_metrics_refresh_result(self.request)
+        except Exception:
+            self.failed.emit(int(self.request.request_id), traceback.format_exc())
+        else:
+            self.finished.emit(result)
 
 
 class MetricsPlotWidget(QWidget):
@@ -48,7 +127,7 @@ class MetricsPlotWidget(QWidget):
         self.canvas_scroll.setWidgetResizable(False)
         self.canvas_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         self.category_combo = QComboBox()
-        self.category_combo.addItems(["FDK sweep", "Make prior", "MBIR-lite", "QC report"])
+        self.category_combo.addItems(["FDK sweep", "Make prior", "MBIR", "MBIR-lite", "QC report"])
         self.detail_label = QLabel("Filter")
         self.detail_combo = QComboBox()
         self.status_label = QLabel("No fast reconstruction run is selected.")
@@ -58,7 +137,11 @@ class MetricsPlotWidget(QWidget):
         self.table_note_label = QLabel("")
         self.table_note_label.setWordWrap(True)
         self._run_folder: Path | None = None
+        self._category_run_roots: dict[str, Path] = {}
         self._live_mbir_metrics: list[object] = []
+        self._live_mbir_lite_metrics: list[object] = []
+        self._waiting_for_live_mbir_metrics = False
+        self._waiting_for_live_mbir_lite_metrics = False
         self._block_detail_signal = False
         self._current_image: np.ndarray | None = None
         self._levels: tuple[float, float] | None = None
@@ -68,6 +151,13 @@ class MetricsPlotWidget(QWidget):
         self._image_artists: list[tuple[object, np.ndarray]] = []
         self._pan_drag: dict[str, object] | None = None
         self._last_layout_category = ""
+        self._polling_enabled = True
+        self._refresh_thread: QThread | None = None
+        self._refresh_worker: _MetricsRefreshWorker | None = None
+        self._refresh_request_id = 0
+        self._active_refresh_request_id = 0
+        self._pending_refresh_sync_detail = False
+        self._last_render_key: tuple[object, ...] | None = None
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Metrics"))
@@ -101,10 +191,17 @@ class MetricsPlotWidget(QWidget):
         self.canvas.mpl_connect("button_press_event", self._on_pan_press)
         self.canvas.mpl_connect("motion_notify_event", self._on_pan_motion)
         self.canvas.mpl_connect("button_release_event", self._on_pan_release)
-        self._refresh_category(sync_detail=True)
+        self._request_refresh(sync_detail=True)
+        self.set_polling_enabled(self.isVisible())
 
     def set_run_folder(self, run_folder: str | Path | None) -> None:
-        self._run_folder = None if not run_folder else _normalize_fast_run_root(Path(run_folder))
+        if not run_folder:
+            self._run_folder = None
+            self._category_run_roots = {}
+        else:
+            root = _normalize_fast_run_root(Path(run_folder))
+            self._run_folder = root
+            self._remember_run_folder(root)
         self.refresh_from_files()
 
     def select_category(self, category: str) -> None:
@@ -114,15 +211,153 @@ class MetricsPlotWidget(QWidget):
             self._refresh_category(sync_detail=True)
 
     def refresh_from_files(self) -> None:
-        self._refresh_category(sync_detail=True)
+        self._request_refresh(sync_detail=True)
 
-    def show_metrics(self, metrics: list[ADMMIterationMetrics]) -> None:
-        self._live_mbir_metrics = list(metrics or [])
-        if not self._live_mbir_metrics and self.category_combo.currentText() == "MBIR-lite":
-            self._refresh_category(sync_detail=True)
+    def show_metrics(self, metrics: list[object], category: str | None = None) -> None:
+        metric_category = category or _infer_metrics_category(metrics)
+        if metric_category == "MBIR-lite":
+            self._live_mbir_lite_metrics = list(metrics or [])
+            if self._live_mbir_lite_metrics:
+                self._waiting_for_live_mbir_lite_metrics = False
+            if not self._live_mbir_lite_metrics and self.category_combo.currentText() == "MBIR-lite":
+                self._request_refresh(sync_detail=True)
+                return
+            if self.category_combo.currentText() == "MBIR-lite":
+                self._request_refresh(sync_detail=False)
             return
-        if self.category_combo.currentText() == "MBIR-lite":
-            self._show_mbir_lite()
+        self._live_mbir_metrics = list(metrics or [])
+        if self._live_mbir_metrics:
+            self._waiting_for_live_mbir_metrics = False
+        if not self._live_mbir_metrics and self.category_combo.currentText() == "MBIR":
+            self._request_refresh(sync_detail=True)
+            return
+        if self.category_combo.currentText() == "MBIR":
+            self._request_refresh(sync_detail=False)
+
+    def begin_live_mbir_session(self, category: str = "MBIR") -> None:
+        if category == "MBIR-lite":
+            self._live_mbir_lite_metrics = []
+            self._waiting_for_live_mbir_lite_metrics = True
+            if self.category_combo.currentText() == "MBIR-lite":
+                self._request_refresh(sync_detail=False)
+            return
+        self._live_mbir_metrics = []
+        self._waiting_for_live_mbir_metrics = True
+        if self.category_combo.currentText() == "MBIR":
+            self._request_refresh(sync_detail=False)
+
+    def clear_live_mbir_metrics(self) -> None:
+        self._live_mbir_metrics = []
+        self._live_mbir_lite_metrics = []
+        self._waiting_for_live_mbir_metrics = False
+        self._waiting_for_live_mbir_lite_metrics = False
+        if self.category_combo.currentText() in {"MBIR", "MBIR-lite"}:
+            self._request_refresh(sync_detail=True)
+
+    def end_live_mbir_session(self, category: str | None = None) -> None:
+        if category in {None, "MBIR"}:
+            self._waiting_for_live_mbir_metrics = False
+        if category in {None, "MBIR-lite"}:
+            self._waiting_for_live_mbir_lite_metrics = False
+        if self.category_combo.currentText() in {"MBIR", "MBIR-lite"}:
+            self._request_refresh(sync_detail=False)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.set_polling_enabled(True)
+
+    def hideEvent(self, event) -> None:
+        self.set_polling_enabled(False)
+        super().hideEvent(event)
+
+    def set_polling_enabled(self, enabled: bool) -> None:
+        self._polling_enabled = bool(enabled)
+        if self._polling_enabled:
+            if not self._poll_timer.isActive():
+                self._poll_timer.start()
+            self._request_refresh(sync_detail=False)
+        else:
+            self._poll_timer.stop()
+
+    def _request_refresh(self, sync_detail: bool = False) -> None:
+        self._refresh_request_id += 1
+        self._pending_refresh_sync_detail = self._pending_refresh_sync_detail or bool(sync_detail)
+        if self._refresh_thread is not None:
+            return
+        next_sync_detail = self._pending_refresh_sync_detail
+        self._pending_refresh_sync_detail = False
+        self._start_refresh_worker(next_sync_detail, self._refresh_request_id)
+
+    def _start_refresh_worker(self, sync_detail: bool, request_id: int) -> None:
+        request = _MetricsRefreshRequest(
+            request_id=int(request_id),
+            category=str(self.category_combo.currentText()),
+            sync_detail=bool(sync_detail),
+            current_detail=str(self.detail_combo.currentText() or "").strip(),
+            category_run_roots=dict(self._category_run_roots),
+            live_mbir_rows=_mbir_rows_from_objects(self._live_mbir_metrics),
+            live_mbir_lite_rows=[_mbir_lite_metric_row_from_object(metric) for metric in self._live_mbir_lite_metrics],
+            waiting_for_live_mbir_metrics=bool(self._waiting_for_live_mbir_metrics),
+            waiting_for_live_mbir_lite_metrics=bool(self._waiting_for_live_mbir_lite_metrics),
+        )
+        thread = QThread(self)
+        worker = _MetricsRefreshWorker(request)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._refresh_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(self._refresh_failed)
+        worker.failed.connect(thread.quit)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._refresh_thread_finished)
+        self._active_refresh_request_id = int(request_id)
+        self._refresh_thread = thread
+        self._refresh_worker = worker
+        thread.start()
+
+    def _refresh_finished(self, result: object) -> None:
+        if isinstance(result, _MetricsRefreshResult) and int(result.request_id) == int(self._refresh_request_id):
+            self._apply_refresh_result(result)
+
+    def _refresh_failed(self, request_id: int, _traceback_text: str) -> None:
+        if int(request_id) == int(self._refresh_request_id):
+            self.table_note_label.setText("Metrics refresh failed. Keeping the last successful view.")
+
+    def _refresh_thread_finished(self) -> None:
+        self._refresh_thread = None
+        self._refresh_worker = None
+        if self._active_refresh_request_id != self._refresh_request_id or self._pending_refresh_sync_detail:
+            next_sync_detail = self._pending_refresh_sync_detail
+            self._pending_refresh_sync_detail = False
+            self._start_refresh_worker(next_sync_detail, self._refresh_request_id)
+
+    def _apply_refresh_result(self, result: _MetricsRefreshResult) -> None:
+        if result.category != self.category_combo.currentText():
+            return
+        if result.render_key == self._last_render_key:
+            self._set_detail_choices(result.detail_choices, result.detail_label, current_choice=result.selected_detail)
+            self.status_label.setText(result.status_text)
+            self.table_note_label.setText(result.table_note_text)
+            return
+        self._set_detail_choices(result.detail_choices, result.detail_label, current_choice=result.selected_detail)
+        self.status_label.setText(result.status_text)
+        self.table_note_label.setText(result.table_note_text)
+        self._fill_table(result.rows, highlight_index=result.highlight_index)
+        if result.render_kind == "fdk":
+            self._render_fdk_sweep(result)
+        elif result.render_kind == "prior":
+            self._render_prior(result)
+        elif result.render_kind == "mbir":
+            self._draw_mbir(result.rows)
+        elif result.render_kind == "mbir_lite":
+            self._draw_mbir_lite(result.rows)
+        elif result.render_kind == "qc":
+            self._render_qc_report(result)
+        else:
+            self._draw_message("No metrics category selected.")
+        self._last_render_key = result.render_key
 
     def current_image(self) -> np.ndarray | None:
         return self._current_image
@@ -181,6 +416,7 @@ class MetricsPlotWidget(QWidget):
         selected_shift: float | None = None,
         recommended_shift: float | None = None,
     ) -> None:
+        self._last_render_key = None
         self._clear_image_display(emit=False)
         self.status_label.setText("Center-search metrics are displayed for the active alignment preview.")
         self._set_detail_choices([])
@@ -232,6 +468,8 @@ class MetricsPlotWidget(QWidget):
         self._last_layout_category = category
         if category == "Make prior":
             self.metrics_splitter.setSizes([940, 140])
+        elif category == "MBIR":
+            self.metrics_splitter.setSizes([1000, 180])
         elif category == "MBIR-lite":
             self.metrics_splitter.setSizes([980, 170])
         elif category == "QC report":
@@ -242,102 +480,30 @@ class MetricsPlotWidget(QWidget):
     def _refresh_category(self, sync_detail: bool = False) -> None:
         category = self.category_combo.currentText()
         self._apply_category_layout(category)
-        if category == "FDK sweep":
-            self._show_fdk_sweep(sync_detail)
-        elif category == "Make prior":
-            self._show_prior(sync_detail)
-        elif category == "MBIR-lite":
-            self._show_mbir_lite()
-        elif category == "QC report":
-            self._show_qc_report()
-        else:
-            self._draw_message("No metrics category selected.")
+        self._request_refresh(sync_detail=sync_detail)
 
     def _show_fdk_sweep(self, sync_detail: bool) -> None:
-        folder = self._fast_folder("fdk_sweep")
-        rows = _read_csv_rows(folder / "scores.csv") if folder is not None else []
-        filters = _unique_nonempty([str(row.get("filter", "")) for row in rows])
-        if sync_detail:
-            self._set_detail_choices(filters, "Filter")
-        preview_filter = self.detail_combo.currentText().strip() if filters else ""
-        if preview_filter not in filters and filters:
-            preview_filter = filters[0]
-        auto_best_index = _best_numeric_row(rows, "score_total", minimize=True)
-        selection = _read_fdk_selection(folder) if folder is not None else {}
-        selected_filter = str(selection.get("best_filter") or "").strip()
-        selection_mode = str(selection.get("selection_mode") or "auto_score").strip()
-        highlight_index = _matching_filter_row(rows, selected_filter) if selected_filter else auto_best_index
-        if highlight_index is None:
-            highlight_index = auto_best_index
-        best_text = ""
-        if auto_best_index is not None:
-            best = rows[auto_best_index]
-            if selection_mode == "manual_override" and selected_filter:
-                best_text = f" Auto score winner: {best.get('filter', '')}; selected filter: {selected_filter}."
-            else:
-                best_text = f" Best: {best.get('filter', '')} (score {best.get('score_total', '')})."
-        self.status_label.setText(f"FDK sweep candidates: {len(rows)}.{best_text}" if rows else "No FDK sweep scores are available yet.")
-        self.table_note_label.setText("FDK score_total is a cost: lower is better. Highlighted row is the filter saved for full-resolution FDK.")
-        self._fill_table(rows, highlight_index=highlight_index)
-        if not rows:
-            self._draw_message("Waiting for FDK sweep scores.csv.")
-            return
-        selected_rows = [row for row in rows if str(row.get("filter", "")) == preview_filter]
-        self._draw_fdk_candidate_previews(folder, preview_filter, selected_rows)
+        self._request_refresh(sync_detail=sync_detail)
 
     def _show_prior(self, sync_detail: bool) -> None:
-        folder = self._fast_folder("prior")
-        rows = _read_csv_rows(folder / "prior_metrics.csv") if folder is not None else []
-        choices = [
-            "Selected prior",
-            "Confidence",
-            "Difference",
-            "Support mask",
-            "Selected prior normalized",
-            "FDK normalized",
-        ]
-        if sync_detail:
-            self._set_detail_choices(choices, "Display")
-        selected = self.detail_combo.currentText().strip() or choices[0]
-        highlight = _prior_selected_row(rows)
-        self.status_label.setText(f"Prior candidates: {len(rows)}." if rows else "No prior metrics are available yet.")
-        self.table_note_label.setText("")
-        self._fill_table(rows, highlight_index=highlight)
-        if folder is None:
-            self._draw_message("No fast reconstruction run is selected.")
-            return
-        self._draw_prior_panel(folder, selected, rows)
+        self._request_refresh(sync_detail=sync_detail)
+
+    def _show_mbir(self) -> None:
+        self._request_refresh(sync_detail=False)
 
     def _show_mbir_lite(self) -> None:
-        self._set_detail_choices([])
-        rows = [_metric_row_from_object(metric) for metric in self._live_mbir_metrics]
-        if not rows:
-            folder = self._fast_folder("mbir_lite")
-            rows = _read_csv_rows(folder / "metrics.csv") if folder is not None else []
-        self.status_label.setText(f"MBIR-lite iterations: {len(rows)}." if rows else "Waiting for MBIR-lite metrics.")
-        self.table_note_label.setText("")
-        self._fill_table(rows)
-        self._draw_mbir_lite(rows)
+        self._request_refresh(sync_detail=False)
 
     def _show_qc_report(self) -> None:
-        self._set_detail_choices([])
-        folder = self._fast_folder("qc")
-        rows = _read_csv_rows(folder / "qc_metrics.csv") if folder is not None else []
-        self.status_label.setText(f"QC metric rows: {len(rows)}." if rows else "No QC report metrics are available yet.")
-        self.table_note_label.setText(
-            "Lower residual is better. Compare Final against FDK and Prior on both tune and QC splits. "
-            "QC bar annotations show the percent change of each held-out QC residual relative to the matching tune residual."
-        )
-        self._fill_table(rows)
-        self._draw_qc_report(folder, rows)
+        self._request_refresh(sync_detail=False)
 
-    def _draw_fdk_candidate_previews(self, folder: Path | None, selected_filter: str, rows: list[dict[str, str]]) -> None:
-        self._start_image_display(f"fdk_sweep:{folder}")
-        if folder is None or not rows:
+    def _render_fdk_sweep(self, result: _MetricsRefreshResult) -> None:
+        preview_items = result.render_payload.get("preview_items") or []
+        selected_filter = str(result.selected_detail or "")
+        self._start_image_display(f"fdk_sweep:{selected_filter}")
+        if not preview_items:
             self._draw_message("Select a filter after FDK sweep scores are available.")
             return
-        preview_paths = [_fdk_preview_path(folder, row) for row in rows]
-        preview_items = [(row, path, _load_preview_image(path, None)) for row, path in zip(rows, preview_paths)]
         image_arrays = [image for _row, _path, image in preview_items if image is not None]
         cols = min(3, max(1, len(preview_items)))
         row_count = max(1, int(np.ceil(len(preview_items) / cols)))
@@ -367,10 +533,14 @@ class MetricsPlotWidget(QWidget):
         self._finish_image_display()
         self.canvas.draw_idle()
 
-    def _draw_prior_panel(self, folder: Path, selected: str, rows: list[dict[str, str]]) -> None:
+    def _render_prior(self, result: _MetricsRefreshResult) -> None:
+        selected = str(result.selected_detail or "Selected prior")
+        preview_image = result.render_payload.get("preview_image")
+        rows = result.rows
+        if not bool(result.render_payload.get("folder_available", False)):
+            self._draw_message("No fast reconstruction run is selected.")
+            return
         self._start_image_display(f"prior:{selected}")
-        image_path, npy_path = _prior_display_paths(folder, selected)
-        preview_image = _load_preview_image(image_path, npy_path)
         if preview_image is not None:
             self._size_canvas_for_image(preview_image, extra_height=260, minimum_width=960, fallback_width=1280)
         else:
@@ -413,6 +583,42 @@ class MetricsPlotWidget(QWidget):
         axis.set_title("Prior candidate metrics", color=TEXT_COLOR, fontsize=9)
         _style_legend(axis.legend(fontsize=7))
 
+    def _draw_mbir(self, rows: list[dict[str, object]]) -> None:
+        self._clear_image_display(emit=False)
+        self.figure.clear()
+        style_figure(self.figure)
+        if not rows:
+            self._draw_message("Waiting for MBIR metrics.")
+            return
+        panels = [
+            ("objective", "Objective", ACCENT_COLOR, True),
+            ("data_residual", "Data residual", "#80D6B6", True),
+            ("data_fidelity", "Data term", "#A8C7F7", True),
+            ("tv_term", "TV term", "#FFCC80", True),
+            ("relative_x_change", "Relative change", "#DDE8F7", True),
+            ("elapsed_s", "Elapsed seconds", "#B39DDB", False),
+        ]
+        if _rows_have_finite_values(rows, "primal_residual"):
+            panels.append(("primal_residual", "Primal residual", "#FF8A80", True))
+        if _rows_have_finite_values(rows, "dual_residual"):
+            panels.append(("dual_residual", "Dual residual", "#F48FB1", True))
+        if _rows_have_finite_values(rows, "cg_residual"):
+            panels.append(("cg_residual", "CG residual", "#90CAF9", True))
+        if _rows_have_finite_values(rows, "cg_iterations"):
+            panels.append(("cg_iterations", "CG iterations", "#A5D6A7", False))
+        self._size_canvas_for_plot_grid(
+            minimum_width=1120,
+            fallback_width=1460,
+            height_ratio=0.72 if len(panels) <= 6 else 0.9,
+        )
+        iterations = np.asarray([_to_float(row.get("iteration"), index + 1) for index, row in enumerate(rows)], dtype=np.float64)
+        for spec, (key, title, color, log_y) in zip(_panel_specs_for_count(self.figure, len(panels)), panels):
+            axis = self.figure.add_subplot(spec)
+            _plot_metric_panel(axis, iterations, rows, key, title, color, log_y, "Iteration")
+        self.figure.subplots_adjust(left=0.055, right=0.985, top=0.955, bottom=0.06, hspace=0.28, wspace=0.22)
+        self.canvas.draw_idle()
+        self._emit_image_changed()
+
     def _draw_mbir_lite(self, rows: list[dict[str, object]]) -> None:
         self._clear_image_display(emit=False)
         self.figure.clear()
@@ -420,7 +626,7 @@ class MetricsPlotWidget(QWidget):
         if not rows:
             self._draw_message("Waiting for MBIR-lite live metrics.")
             return
-        self._size_canvas_for_plot_grid(minimum_width=1080, fallback_width=1400, height_ratio=0.86)
+        self._size_canvas_for_plot_grid(minimum_width=1080, fallback_width=1400, height_ratio=0.84)
         panels = [
             ("objective_total", "Objective", ACCENT_COLOR, True),
             ("data_weighted", "Data weighted", "#80D6B6", True),
@@ -431,37 +637,17 @@ class MetricsPlotWidget(QWidget):
             ("elapsed_s", "Elapsed seconds", "#B39DDB", False),
         ]
         iterations = np.asarray([_to_float(row.get("iteration"), index + 1) for index, row in enumerate(rows)], dtype=np.float64)
-        grid = self.figure.add_gridspec(3, 3, height_ratios=[1.0, 1.0, 0.92], hspace=0.32, wspace=0.26)
-        panel_specs = [
-            grid[0, 0],
-            grid[0, 1],
-            grid[0, 2],
-            grid[1, 0],
-            grid[1, 1],
-            grid[1, 2],
-            grid[2, :],
-        ]
-        for spec, (key, title, color, log_y) in zip(panel_specs, panels):
+        for spec, (key, title, color, log_y) in zip(_panel_specs_for_count(self.figure, len(panels)), panels):
             axis = self.figure.add_subplot(spec)
-            style_axis(axis, grid=True)
-            values = np.asarray([_to_float(row.get(key)) for row in rows], dtype=np.float64)
-            finite = np.isfinite(iterations) & np.isfinite(values)
-            if np.any(finite):
-                plot_values = np.maximum(values, 1e-30) if log_y else values
-                axis.plot(iterations[finite], plot_values[finite], linewidth=1.4, marker="o", markersize=3, color=color)
-                if log_y:
-                    axis.set_yscale("log")
-            axis.set_title(title, color=TEXT_COLOR, fontsize=11)
-            axis.set_xlabel("Sweep", fontsize=9)
-            axis.tick_params(labelsize=8)
-        self.figure.subplots_adjust(left=0.06, right=0.985, top=0.955, bottom=0.06)
+            _plot_metric_panel(axis, iterations, rows, key, title, color, log_y, "Sweep")
+        self.figure.subplots_adjust(left=0.06, right=0.985, top=0.955, bottom=0.06, hspace=0.28, wspace=0.22)
         self.canvas.draw_idle()
         self._emit_image_changed()
 
-    def _draw_qc_report(self, folder: Path | None, rows: list[dict[str, str]]) -> None:
+    def _render_qc_report(self, result: _MetricsRefreshResult) -> None:
+        rows = result.rows
+        image = result.render_payload.get("preview_image")
         self._start_image_display("qc")
-        preview_path = None if folder is None else folder / "preview_panel.png"
-        image = _load_preview_image(preview_path, None) if preview_path is not None else None
         if image is not None:
             self._size_canvas_for_image(image, extra_height=300, minimum_width=1040, fallback_width=1480)
         else:
@@ -745,17 +931,29 @@ class MetricsPlotWidget(QWidget):
         if self.on_image_changed is not None:
             self.on_image_changed()
 
-    def _fast_folder(self, name: str) -> Path | None:
-        if self._run_folder is None:
+    def _standard_metrics_path(self) -> Path | None:
+        root = self._category_run_roots.get("MBIR")
+        path = _standard_metrics_csv_path(root)
+        if path is None:
             return None
-        folder = self._run_folder / "fast_recon" / name
-        legacy = self._run_folder / "fast_recon" / "fast_recon" / name
-        if not folder.exists() and legacy.exists():
-            return legacy
-        return folder
+        return path if path.exists() else None
 
-    def _set_detail_choices(self, choices: list[str], label: str = "") -> None:
-        current = self.detail_combo.currentText()
+    def _fast_folder(self, name: str) -> Path | None:
+        category = self.category_combo.currentText()
+        root = self._category_run_roots.get(category)
+        return _fast_folder_for_root(root, name)
+
+    def _remember_run_folder(self, root: Path) -> None:
+        normalized = _normalize_fast_run_root(Path(root))
+        standard_metrics = normalized / "metrics" / "metrics.csv"
+        if standard_metrics.exists():
+            self._category_run_roots["MBIR"] = normalized
+        for category, (child, filename) in _FAST_CATEGORY_CHILDREN.items():
+            if _fast_child_metric_path(normalized, child, filename) is not None:
+                self._category_run_roots[category] = normalized
+
+    def _set_detail_choices(self, choices: list[str], label: str = "", current_choice: str | None = None) -> None:
+        current = str(current_choice if current_choice is not None else self.detail_combo.currentText())
         self._block_detail_signal = True
         self.detail_combo.clear()
         for choice in choices:
@@ -793,6 +991,90 @@ class MetricsPlotWidget(QWidget):
             self.table.selectRow(highlight_index)
 
 
+def _standard_metrics_csv_path(root: Path | None) -> Path | None:
+    if root is None:
+        return None
+    normalized = _normalize_fast_run_root(Path(root))
+    return normalized / "metrics" / "metrics.csv"
+
+
+def _fast_folder_for_root(root: Path | None, name: str) -> Path | None:
+    if root is None:
+        return None
+    normalized = _normalize_fast_run_root(Path(root))
+    folder = normalized / "fast_recon" / name
+    legacy = normalized / "fast_recon" / "fast_recon" / name
+    if not folder.exists() and legacy.exists():
+        return legacy
+    return folder
+
+
+def _path_cache_key(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        return str(Path(path).resolve())
+    except Exception:
+        return str(path)
+
+
+def _path_stamp(path: Path | None) -> object:
+    if path is None:
+        return None
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return (False, 0, 0)
+    return (True, int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _preview_stamp(image_path: Path | None, npy_path: Path | None) -> tuple[object, object]:
+    return (_path_stamp(image_path), _path_stamp(npy_path))
+
+
+def _read_csv_rows_cached(path: Path | None) -> list[dict[str, str]]:
+    if path is None:
+        return []
+    key = _path_cache_key(path)
+    stamp = _path_stamp(path)
+    with _CSV_CACHE_LOCK:
+        cached = _CSV_CACHE.get(str(key))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    rows = _read_csv_rows(path)
+    with _CSV_CACHE_LOCK:
+        _CSV_CACHE[str(key)] = (stamp, rows)
+    return rows
+
+
+def _read_text_mapping_cached(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    key = _path_cache_key(path)
+    stamp = _path_stamp(path)
+    with _TEXT_CACHE_LOCK:
+        cached = _TEXT_CACHE.get(str(key))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    values = _read_text_mapping(path)
+    with _TEXT_CACHE_LOCK:
+        _TEXT_CACHE[str(key)] = (stamp, values)
+    return values
+
+
+def _load_preview_image_cached(image_path: Path | None, npy_path: Path | None) -> np.ndarray | None:
+    key = (_path_cache_key(image_path), _path_cache_key(npy_path))
+    stamp = _preview_stamp(image_path, npy_path)
+    with _PREVIEW_CACHE_LOCK:
+        cached = _PREVIEW_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    image = _load_preview_image(image_path, npy_path)
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_CACHE[key] = (stamp, image)
+    return image
+
+
 def _read_csv_rows(path: Path) -> list[dict[str, str]]:
     if not path.exists() or path.stat().st_size == 0:
         return []
@@ -810,6 +1092,19 @@ def _normalize_fast_run_root(path: Path) -> Path:
     while root.name == "fast_recon":
         root = root.parent
     return root
+
+
+def _fast_child_metric_path(root: Path, child: str, filename: str) -> Path | None:
+    normalized = _normalize_fast_run_root(Path(root))
+    folder = normalized / "fast_recon" / child
+    legacy = normalized / "fast_recon" / "fast_recon" / child
+    candidate = folder / filename
+    if candidate.exists():
+        return candidate
+    legacy_candidate = legacy / filename
+    if legacy_candidate.exists():
+        return legacy_candidate
+    return None
 
 
 def _unique_nonempty(values: list[str]) -> list[str]:
@@ -842,8 +1137,7 @@ def _matching_filter_row(rows: list[dict[str, object]], filter_name: str) -> int
     return None
 
 
-def _read_fdk_selection(folder: Path) -> dict[str, str]:
-    path = folder / "best_filter.yaml"
+def _read_text_mapping(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
     values: dict[str, str] = {}
@@ -856,6 +1150,10 @@ def _read_fdk_selection(folder: Path) -> dict[str, str]:
     except Exception:
         return {}
     return values
+
+
+def _read_fdk_selection(folder: Path) -> dict[str, str]:
+    return _read_text_mapping(folder / "best_filter.yaml")
 
 
 def _prior_selected_row(rows: list[dict[str, object]]) -> int | None:
@@ -948,6 +1246,198 @@ def _load_preview_image(image_path: Path | None, npy_path: Path | None) -> np.nd
     return None
 
 
+def _rows_render_signature(rows: list[dict[str, object]]) -> tuple[object, ...]:
+    signature_rows: list[tuple[object, ...]] = []
+    for row in rows:
+        signature_rows.append(tuple((str(key), repr(row.get(key))) for key in row.keys()))
+    return tuple(signature_rows)
+
+
+def _load_metrics_refresh_result(request: _MetricsRefreshRequest) -> _MetricsRefreshResult:
+    category = str(request.category or "")
+    if category == "FDK sweep":
+        root = request.category_run_roots.get("FDK sweep")
+        folder = _fast_folder_for_root(root, "fdk_sweep")
+        scores_path = None if folder is None else folder / "scores.csv"
+        rows = _read_csv_rows_cached(scores_path)
+        filters = _unique_nonempty([str(row.get("filter", "")) for row in rows])
+        selected_detail = str(request.current_detail or "").strip()
+        if selected_detail not in filters and filters:
+            selected_detail = filters[0]
+        auto_best_index = _best_numeric_row(rows, "score_total", minimize=True)
+        selection_path = None if folder is None else folder / "best_filter.yaml"
+        selection = _read_text_mapping_cached(selection_path)
+        selected_filter = str(selection.get("best_filter") or "").strip()
+        selection_mode = str(selection.get("selection_mode") or "auto_score").strip()
+        highlight_index = _matching_filter_row(rows, selected_filter) if selected_filter else auto_best_index
+        if highlight_index is None:
+            highlight_index = auto_best_index
+        best_text = ""
+        if auto_best_index is not None:
+            best = rows[auto_best_index]
+            if selection_mode == "manual_override" and selected_filter:
+                best_text = f" Auto score winner: {best.get('filter', '')}; selected filter: {selected_filter}."
+            else:
+                best_text = f" Best: {best.get('filter', '')} (score {best.get('score_total', '')})."
+        filtered_rows = [row for row in rows if str(row.get("filter", "")) == selected_detail]
+        preview_items: list[tuple[dict[str, str], Path, np.ndarray | None]] = []
+        preview_tokens: list[tuple[str, object]] = []
+        if folder is not None:
+            for row in filtered_rows:
+                path = _fdk_preview_path(folder, row)
+                preview_items.append((row, path, _load_preview_image_cached(path, None)))
+                preview_tokens.append((str(path), _preview_stamp(path, None)))
+        return _MetricsRefreshResult(
+            request_id=request.request_id,
+            category=category,
+            detail_choices=filters,
+            detail_label="Filter",
+            selected_detail=selected_detail,
+            status_text=f"FDK sweep candidates: {len(rows)}.{best_text}" if rows else "No FDK sweep scores are available yet.",
+            table_note_text="FDK score_total is a cost: lower is better. Highlighted row is the filter saved for full-resolution FDK.",
+            rows=rows,
+            highlight_index=highlight_index,
+            render_kind="fdk",
+            render_payload={"preview_items": preview_items},
+            render_key=(
+                category,
+                _path_stamp(scores_path),
+                _path_stamp(selection_path),
+                selected_detail,
+                tuple(preview_tokens),
+            ),
+        )
+    if category == "Make prior":
+        root = request.category_run_roots.get("Make prior")
+        folder = _fast_folder_for_root(root, "prior")
+        metrics_path = None if folder is None else folder / "prior_metrics.csv"
+        rows = _read_csv_rows_cached(metrics_path)
+        choices = [
+            "Selected prior",
+            "Confidence",
+            "Difference",
+            "Support mask",
+            "Selected prior normalized",
+            "FDK normalized",
+        ]
+        selected_detail = str(request.current_detail or "").strip() or choices[0]
+        if selected_detail not in choices:
+            selected_detail = choices[0]
+        image_path, npy_path = _prior_display_paths(folder, selected_detail) if folder is not None else (None, None)
+        return _MetricsRefreshResult(
+            request_id=request.request_id,
+            category=category,
+            detail_choices=choices,
+            detail_label="Display",
+            selected_detail=selected_detail,
+            status_text=f"Prior candidates: {len(rows)}." if rows else "No prior metrics are available yet.",
+            table_note_text="",
+            rows=rows,
+            highlight_index=_prior_selected_row(rows),
+            render_kind="prior",
+            render_payload={
+                "folder_available": folder is not None,
+                "preview_image": _load_preview_image_cached(image_path, npy_path),
+            },
+            render_key=(
+                category,
+                _path_stamp(metrics_path),
+                selected_detail,
+                _preview_stamp(image_path, npy_path),
+            ),
+        )
+    if category == "MBIR":
+        rows = list(request.live_mbir_rows)
+        source_key: object = ("live", _rows_render_signature(rows))
+        if not rows and not request.waiting_for_live_mbir_metrics:
+            path = _standard_metrics_csv_path(request.category_run_roots.get("MBIR"))
+            rows = _read_csv_rows_cached(path)
+            source_key = ("file", _path_stamp(path))
+        solver_text = _solver_display_name_from_key(_solver_from_rows(rows))
+        if rows:
+            status_text = f"MBIR iterations: {len(rows)} | solver {solver_text}."
+        elif request.waiting_for_live_mbir_metrics:
+            status_text = "Waiting for MBIR metrics."
+        else:
+            status_text = "No MBIR metrics are available yet."
+        return _MetricsRefreshResult(
+            request_id=request.request_id,
+            category=category,
+            detail_choices=[],
+            detail_label="",
+            selected_detail="",
+            status_text=status_text,
+            table_note_text=(
+                "Standard MBIR shows solver-specific panels only when those values are available. "
+                "ADMM residual and CG plots appear automatically for ADMM runs."
+            ),
+            rows=rows,
+            highlight_index=None,
+            render_kind="mbir",
+            render_payload={},
+            render_key=(category, source_key, bool(request.waiting_for_live_mbir_metrics)),
+        )
+    if category == "MBIR-lite":
+        rows = list(request.live_mbir_lite_rows)
+        source_key = ("live", _rows_render_signature(rows))
+        if not rows and not request.waiting_for_live_mbir_lite_metrics:
+            folder = _fast_folder_for_root(request.category_run_roots.get("MBIR-lite"), "mbir_lite")
+            metrics_path = None if folder is None else folder / "metrics.csv"
+            rows = _read_csv_rows_cached(metrics_path)
+            source_key = ("file", _path_stamp(metrics_path))
+        return _MetricsRefreshResult(
+            request_id=request.request_id,
+            category=category,
+            detail_choices=[],
+            detail_label="",
+            selected_detail="",
+            status_text=f"MBIR-lite iterations: {len(rows)}." if rows else "Waiting for MBIR-lite metrics.",
+            table_note_text="",
+            rows=rows,
+            highlight_index=None,
+            render_kind="mbir_lite",
+            render_payload={},
+            render_key=(category, source_key, bool(request.waiting_for_live_mbir_lite_metrics)),
+        )
+    if category == "QC report":
+        root = request.category_run_roots.get("QC report")
+        folder = _fast_folder_for_root(root, "qc")
+        metrics_path = None if folder is None else folder / "qc_metrics.csv"
+        preview_path = None if folder is None else folder / "preview_panel.png"
+        rows = _read_csv_rows_cached(metrics_path)
+        return _MetricsRefreshResult(
+            request_id=request.request_id,
+            category=category,
+            detail_choices=[],
+            detail_label="",
+            selected_detail="",
+            status_text=f"QC metric rows: {len(rows)}." if rows else "No QC report metrics are available yet.",
+            table_note_text=(
+                "Lower residual is better. Compare Final against FDK and Prior on both tune and QC splits. "
+                "QC bar annotations show the percent change of each held-out QC residual relative to the matching tune residual."
+            ),
+            rows=rows,
+            highlight_index=None,
+            render_kind="qc",
+            render_payload={"preview_image": _load_preview_image_cached(preview_path, None)},
+            render_key=(category, _path_stamp(metrics_path), _preview_stamp(preview_path, None)),
+        )
+    return _MetricsRefreshResult(
+        request_id=request.request_id,
+        category=category,
+        detail_choices=[],
+        detail_label="",
+        selected_detail="",
+        status_text="No metrics category selected.",
+        table_note_text="",
+        rows=[],
+        highlight_index=None,
+        render_kind="message",
+        render_payload={},
+        render_key=(category, "message"),
+    )
+
+
 def _as_display_image(image: np.ndarray | None) -> np.ndarray | None:
     if image is None:
         return None
@@ -962,7 +1452,50 @@ def _as_display_image(image: np.ndarray | None) -> np.ndarray | None:
     return np.asarray(array, dtype=np.float32)
 
 
-def _metric_row_from_object(metric: object) -> dict[str, object]:
+def _infer_metrics_category(metrics: list[object]) -> str:
+    if any(hasattr(metric, "prior_anchor_term") or hasattr(metric, "objective_total") for metric in metrics or []):
+        return "MBIR-lite"
+    return "MBIR"
+
+
+def _mbir_rows_from_objects(metrics: list[object]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    previous_elapsed = 0.0
+    for metric in metrics or []:
+        row = _mbir_metric_row_from_object(metric, previous_elapsed)
+        elapsed_value = _to_float(row.get("elapsed_s"), previous_elapsed)
+        previous_elapsed = elapsed_value if np.isfinite(elapsed_value) else previous_elapsed
+        rows.append(row)
+    return rows
+
+
+def _mbir_metric_row_from_object(metric: object, previous_elapsed: float = 0.0) -> dict[str, object]:
+    data_fidelity = getattr(metric, "data_fidelity", "")
+    data_fidelity_value = _to_float(data_fidelity)
+    elapsed = getattr(metric, "elapsed_s", "")
+    elapsed_value = _to_float(elapsed)
+    row: dict[str, object] = {
+        "iteration": getattr(metric, "iteration", ""),
+        "objective": getattr(metric, "objective", getattr(metric, "objective_total", "")),
+        "data_fidelity": data_fidelity,
+        "data_residual": float(np.sqrt(max(2.0 * data_fidelity_value, 0.0))) if np.isfinite(data_fidelity_value) else "",
+        "tv_term": getattr(metric, "tv_term", ""),
+        "primal_residual": getattr(metric, "primal_residual", ""),
+        "dual_residual": getattr(metric, "dual_residual", ""),
+        "relative_x_change": getattr(metric, "relative_x_change", getattr(metric, "relative_change", "")),
+        "cg_residual": getattr(metric, "cg_residual", ""),
+        "cg_iterations": getattr(metric, "cg_iterations", ""),
+        "elapsed_s": elapsed,
+        "solver": getattr(metric, "solver", ""),
+    }
+    if np.isfinite(elapsed_value):
+        row["iteration_time_s"] = max(0.0, elapsed_value - max(float(previous_elapsed), 0.0))
+    else:
+        row["iteration_time_s"] = ""
+    return row
+
+
+def _mbir_lite_metric_row_from_object(metric: object) -> dict[str, object]:
     return {
         "iteration": getattr(metric, "iteration", ""),
         "objective_total": getattr(metric, "objective_total", getattr(metric, "objective", "")),
@@ -993,6 +1526,91 @@ def _format_table_value(value: object) -> str:
     if np.isfinite(numeric) and str(value).strip() not in {"0", "1"}:
         return f"{numeric:.6g}"
     return str(value)
+
+
+def _rows_have_finite_values(rows: list[dict[str, object]], key: str) -> bool:
+    return any(np.isfinite(_to_float(row.get(key))) for row in rows)
+
+
+def _solver_from_rows(rows: list[dict[str, object]]) -> str:
+    if not rows:
+        return "unknown"
+    return str(rows[-1].get("solver", "unknown") or "unknown").strip().lower()
+
+
+def _solver_display_name_from_key(solver: str) -> str:
+    key = str(solver or "unknown").strip().lower()
+    return {
+        "admm": "ADMM",
+        "pdhg_low_memory": "PDHG",
+        "streaming_subset_tv": "Streaming subset TV",
+        "anchored_streaming_subset_tv": "Anchored subset TV",
+    }.get(key, key.replace("_", " ").title() or "Unknown")
+
+
+def _panel_specs_for_count(figure: Figure, count: int) -> list[object]:
+    panel_count = max(1, int(count))
+    if panel_count <= 3:
+        rows, cols = 1, panel_count
+    elif panel_count == 4:
+        rows, cols = 2, 2
+    elif panel_count <= 6:
+        rows, cols = 2, 3
+    else:
+        rows, cols = int(np.ceil(panel_count / 3.0)), 3
+    grid = figure.add_gridspec(rows, cols, hspace=0.3, wspace=0.24)
+    specs: list[object] = []
+    full_rows = panel_count // cols
+    remainder = panel_count % cols
+    for row in range(full_rows):
+        for col in range(cols):
+            specs.append(grid[row, col])
+    if remainder:
+        row = full_rows
+        if remainder == cols:
+            for col in range(cols):
+                specs.append(grid[row, col])
+        elif remainder == 1:
+            specs.append(grid[row, :])
+        else:
+            subgrid = grid[row, :].subgridspec(1, remainder, wspace=0.24)
+            for col in range(remainder):
+                specs.append(subgrid[0, col])
+    return specs
+
+
+def _plot_metric_panel(
+    axis,
+    iterations: np.ndarray,
+    rows: list[dict[str, object]],
+    key: str,
+    title: str,
+    color: str,
+    log_y: bool,
+    x_label: str,
+) -> None:
+    style_axis(axis, grid=True)
+    values = np.asarray([_to_float(row.get(key)) for row in rows], dtype=np.float64)
+    finite = np.isfinite(iterations) & np.isfinite(values)
+    if np.any(finite):
+        plot_values = np.maximum(values[finite], 1e-30) if log_y else values[finite]
+        axis.plot(iterations[finite], plot_values, linewidth=1.45, marker="o", markersize=3, color=color)
+        if log_y:
+            axis.set_yscale("log")
+        min_iteration = float(np.min(iterations[finite]))
+        max_iteration = float(np.max(iterations[finite]))
+        if max_iteration <= min_iteration:
+            axis.set_xlim(min_iteration - 0.5, max_iteration + 0.5)
+        else:
+            axis.set_xlim(min_iteration, max_iteration)
+        axis.margins(y=0.16)
+    else:
+        axis.text(0.5, 0.5, "No finite values", ha="center", va="center", transform=axis.transAxes, color=MUTED_TEXT_COLOR)
+        axis.axis("off")
+        return
+    axis.set_title(title, color=TEXT_COLOR, fontsize=11)
+    axis.set_xlabel(x_label, fontsize=9)
+    axis.tick_params(labelsize=8)
 
 
 class DeviceMonitorWidget(QWidget):

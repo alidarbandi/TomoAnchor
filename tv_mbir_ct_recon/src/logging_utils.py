@@ -4,6 +4,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
+from .io_utils import replace_file_atomically, temporary_output_path
+
 
 def timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -47,7 +49,11 @@ def write_text_lines(path: str | Path, lines: Iterable[str], append: bool = Fals
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     text = "\n".join(str(line) for line in lines) + "\n"
-    mode = "a" if append else "w"
-    with output.open(mode, encoding="utf-8") as handle:
+    if append:
+        with output.open("a", encoding="utf-8") as handle:
+            handle.write(text)
+        return output
+    temp = temporary_output_path(output, suffix=".txt.tmp")
+    with temp.open("w", encoding="utf-8") as handle:
         handle.write(text)
-    return output
+    return replace_file_atomically(temp, output)

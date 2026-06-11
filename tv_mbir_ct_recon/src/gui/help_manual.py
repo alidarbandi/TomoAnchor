@@ -447,8 +447,8 @@ Attenuation b = -log(Transmission)
 <tr><th>Control</th><th>What it does</th><th>Guidance</th></tr>
 <tr>
 <td>Histogram level widget</td>
-<td>Shows the intensity histogram for the active image. Drag the low and high markers to change display contrast.</td>
-<td>This affects viewing only; it does not change reconstruction data.</td>
+<td>Shows the intensity histogram for the active image. Drag the low and high markers to change display contrast. Turn on Log histogram when you want to inspect low-count tails more clearly.</td>
+<td>This affects viewing only; it does not change reconstruction data. The log/linear histogram choice stays active until you change it back.</td>
 </tr>
 <tr>
 <td>Auto 1-99%</td>
@@ -632,7 +632,7 @@ stretched, doubled, or displaced reconstructions.
 <tr>
 <td>Mode: existing_fdk</td>
 <td>Loads an existing .npy FDK volume and resizes it if the MBIR debug grid differs.</td>
-<td>Recommended for large full-resolution MBIR after you have already saved an FDK initialization.</td>
+<td>Recommended for large full-resolution MBIR after you have already saved an FDK initialization. You can also use a checkpointed standard MBIR <code>mbir_final_volume.npy</code> here to continue from the latest saved state.</td>
 </tr>
 <tr>
 <td>Mode: zeros</td>
@@ -647,7 +647,7 @@ stretched, doubled, or displaced reconstructions.
 <tr>
 <td>Existing FDK volume .npy</td>
 <td>Path to an existing FDK numpy volume for existing_fdk mode.</td>
-<td>Use the saved fdk_initial_volume.npy from a previous run.</td>
+<td>Use the saved fdk_initial_volume.npy from a previous run, or point it to a checkpointed standard MBIR <code>mbir_final_volume.npy</code>.</td>
 </tr>
 <tr>
 <td>Constant value</td>
@@ -1619,6 +1619,11 @@ zoom, and pan controls as the other image tabs.
 <td>The highlighted table row is the selected candidate. The graph helps show which TV strength reduced background noise while preserving edges and anchor consistency.</td>
 </tr>
 <tr>
+<td>MBIR</td>
+<td>Live iteration graphs and a metrics table from the current run or metrics/metrics.csv for standard full MBIR.</td>
+<td>Use this for standard MBIR objective, residual, TV, relative-change, and solver-specific plots such as ADMM residuals and CG behavior when available.</td>
+</tr>
+<tr>
 <td>MBIR-lite</td>
 <td>Live iteration graphs and a metrics table from the current run or fast_recon/mbir_lite/metrics.csv.</td>
 <td>Look for objective/data terms and relative_change to decrease or flatten. QC residual should not worsen sharply if QC anchors are available.</td>
@@ -1823,7 +1828,7 @@ Some config fields are not exposed in the left-side GUI but can be saved, loaded
 <tr><td>alignment.shift_interpolation_order</td><td>Spline interpolation order for drift shifting.</td><td>Default 1 is linear and robust.</td></tr>
 <tr><td>alignment.shift_boundary_mode</td><td>Boundary fill mode for drift shifting.</td><td>Default nearest avoids introducing zeros at edges.</td></tr>
 <tr><td>mbir.tv_type</td><td>TV model label.</td><td>Currently isotropic_3d is the implemented mode.</td></tr>
-<tr><td>mbir.save_every</td><td>Interval intended for intermediate save behavior.</td><td>Keep default unless extending output behavior.</td></tr>
+<tr><td>mbir.save_every</td><td>Iteration interval for standard MBIR checkpoint saves and live preview refresh.</td><td>Default 5. Every save updates mbir/mbir_final_volume.npy and the current MBIR metrics/preview files so the run can be monitored and restarted from the latest checkpoint if needed.</td></tr>
 <tr><td>mbir.pdhg_power_iterations</td><td>Power iterations used to estimate PDHG operator norm.</td><td>More iterations improve step estimate but add startup time.</td></tr>
 <tr><td>mbir.pdhg_step_safety</td><td>PDHG step-size safety factor.</td><td>Default 0.95. Lower if PDHG oscillates.</td></tr>
 <tr><td>mbir.pdhg_theta</td><td>PDHG extrapolation parameter.</td><td>Default 1.0. Change only for solver experiments.</td></tr>

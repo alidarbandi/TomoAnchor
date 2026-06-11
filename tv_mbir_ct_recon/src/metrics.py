@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .admm_tv_mbir import ADMMIterationMetrics
+from .io_utils import replace_file_atomically, temporary_output_path
 
 
 def write_metrics_csv(path: str | Path, metrics: Iterable[ADMMIterationMetrics]) -> Path:
@@ -20,8 +21,9 @@ def write_metrics_csv(path: str | Path, metrics: Iterable[ADMMIterationMetrics])
         elapsed = float(row.get("elapsed_s", 0.0))
         row["iteration_time_s"] = max(0.0, elapsed - previous_elapsed)
         previous_elapsed = elapsed
-    pd.DataFrame(rows).to_csv(output, index=False)
-    return output
+    temp = temporary_output_path(output, suffix=".csv.tmp")
+    pd.DataFrame(rows).to_csv(temp, index=False)
+    return replace_file_atomically(temp, output)
 
 
 def rmse(a: np.ndarray, b: np.ndarray) -> float:

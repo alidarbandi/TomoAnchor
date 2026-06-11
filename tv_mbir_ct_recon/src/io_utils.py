@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable, Sequence
+from uuid import uuid4
 
 import numpy as np
 import tifffile
@@ -11,6 +13,27 @@ from .cpu_utils import bounded_thread_map, default_cpu_parallel_plan
 
 
 TIFF_PATTERNS = ("*.tif", "*.tiff", "*.TIF", "*.TIFF")
+
+
+def temporary_output_path(path: str | Path, suffix: str = ".tmp") -> Path:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    final_suffix = "".join(output.suffixes)
+    marker = str(suffix or ".tmp")
+    if final_suffix and marker.startswith(final_suffix):
+        marker = marker[len(final_suffix) :] or ".tmp"
+    if not marker.startswith("."):
+        marker = f".{marker}"
+    stem = output.name[: -len(final_suffix)] if final_suffix else output.name
+    return output.parent / f".{stem}.{uuid4().hex}{marker}{final_suffix}"
+
+
+def replace_file_atomically(temp_path: str | Path, final_path: str | Path) -> Path:
+    temp = Path(temp_path)
+    final = Path(final_path)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(str(temp), str(final))
+    return final
 
 
 def list_tiff_files(folder: str | Path) -> list[Path]:
@@ -160,15 +183,17 @@ def load_projection_stack(
 def save_image(path: str | Path, image: np.ndarray) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(output), np.asarray(image, dtype=np.float32), photometric="minisblack")
-    return output
+    temp = temporary_output_path(output, suffix=".tif.tmp")
+    tifffile.imwrite(str(temp), np.asarray(image, dtype=np.float32), photometric="minisblack")
+    return replace_file_atomically(temp, output)
 
 
 def save_stack_tiff(path: str | Path, stack: np.ndarray) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(str(output), np.asarray(stack, dtype=np.float32), photometric="minisblack")
-    return output
+    temp = temporary_output_path(output, suffix=".tif.tmp")
+    tifffile.imwrite(str(temp), np.asarray(stack, dtype=np.float32), photometric="minisblack")
+    return replace_file_atomically(temp, output)
 
 
 def save_stack_folder(
@@ -205,8 +230,9 @@ def save_png_image(path: str | Path, image: np.ndarray, cmap: str = "gray") -> P
         high = low + 1.0
     scaled = np.clip((array - low) / (high - low), 0.0, 1.0)
     scaled = np.nan_to_num(scaled, nan=0.0, posinf=1.0, neginf=0.0)
-    mpimg.imsave(str(output), scaled, cmap=cmap, vmin=0.0, vmax=1.0)
-    return output
+    temp = temporary_output_path(output, suffix=".png.tmp")
+    mpimg.imsave(str(temp), scaled, cmap=cmap, vmin=0.0, vmax=1.0)
+    return replace_file_atomically(temp, output)
 
 
 def _normalize_binning(binning: int | tuple[int, int]) -> tuple[int, int]:
